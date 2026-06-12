@@ -1,0 +1,4 @@
+/build-agent
+/.build/
+/work/
+*.sqlite*

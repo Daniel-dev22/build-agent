@@ -1,0 +1,12 @@
+{
+  "project": "build-agent",
+  "image_prefix": "",
+  "ssh": true,
+  "platform": { "mode": "auto" },
+  "version": { "scheme": "timestamp" },
+  "tag_rotation": true,
+  "retention_keep": 15,
+  "services": [
+    { "name": "build-agent", "context": ".", "dockerfile": "Dockerfile" }
+  ]
+}
