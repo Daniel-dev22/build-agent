@@ -12,14 +12,21 @@ import (
 // ---------------------------------------------------------------------------
 
 // BuildRequest is the trigger body. Descriptor is the repo's build.json verbatim.
+//
+// The build context comes from EITHER Repo/Ref (the agent clones repo@ref) OR
+// ContextB64 (the caller uploads the context inline). The latter is for projects
+// whose Dockerfile/context isn't in a standalone cloneable repo — e.g. genmon,
+// whose context lives in the ansible repo's genmon/image/ dir. Exactly one source
+// is required.
 type BuildRequest struct {
 	Descriptor Descriptor `json:"descriptor"`
-	Repo       string     `json:"repo"`              // git URL (ssh or https form)
-	Ref        string     `json:"ref"`               // tag / branch / commit
-	Registry   string     `json:"registry"`          // overrides Descriptor default
-	Version    string     `json:"version,omitempty"` // required when version.scheme=external
-	Services   []string   `json:"services,omitempty"`// subset to build; empty = all
-	Private    *bool      `json:"private,omitempty"` // nil = infer from repo host/org
+	Repo       string     `json:"repo"`                  // git URL (ssh or https form)
+	Ref        string     `json:"ref"`                   // tag / branch / commit
+	ContextB64 string     `json:"context_b64,omitempty"` // base64(gzip(tar)) of the build context — alternative to Repo/Ref
+	Registry   string     `json:"registry"`              // overrides Descriptor default
+	Version    string     `json:"version,omitempty"`     // required when version.scheme=external
+	Services   []string   `json:"services,omitempty"`    // subset to build; empty = all
+	Private    *bool      `json:"private,omitempty"`     // nil = infer from repo host/org
 	TriggerKey string     `json:"trigger_key,omitempty"`
 }
 
