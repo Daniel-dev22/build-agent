@@ -25,8 +25,12 @@ func (a *app) handleTriggerBuild(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "descriptor.project and descriptor.services are required"})
 		return
 	}
-	if req.Repo == "" || req.Registry == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "repo and registry are required"})
+	if req.Registry == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "registry is required"})
+		return
+	}
+	if (req.Repo == "") == (req.ContextB64 == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exactly one of repo or context_b64 is required"})
 		return
 	}
 	if req.Descriptor.Version.Scheme == "external" && req.Version == "" {

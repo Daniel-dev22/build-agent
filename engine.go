@@ -240,28 +240,39 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 		onChange(EventFailed)
 	}
 
-	// Private repos vend a short-lived GitHub App installation token from
-	// controller; it is used for the clone URL and as a buildx secret for
-	// `go mod download` of private modules. Never written into the clone.
-	var secretFile, cloneToken string
-	if isPrivate(req) {
-		tok, err := vendGitHubToken(ctx, e.cc, e.cfg.ControlCenterURL, []string{repoSlug(req.Repo)})
-		if err != nil {
-			fail("github token vend: " + err.Error())
+	// Context source: an uploaded inline context (genmon-style) extracts into the
+	// workdir; otherwise the agent clones repo@ref. Token vend only applies to the
+	// clone path — an uploaded context never needs git auth, so secretFile stays
+	// empty and buildService skips the buildx secret.
+	var secretFile string
+	if req.ContextB64 != "" {
+		if err := extractContextTarGz(req.ContextB64, dir); err != nil {
+			fail("extract context: " + err.Error())
 			return
 		}
-		cloneToken = tok.Token
-		secretFile = dir + ".ghtoken"
-		if err := os.WriteFile(secretFile, []byte(tok.Token), 0o600); err != nil {
-			fail("write token secret: " + err.Error())
+	} else {
+		// Private repos vend a short-lived GitHub App installation token from
+		// controller; it is used for the clone URL and as a buildx secret for
+		// `go mod download` of private modules. Never written into the clone.
+		var cloneToken string
+		if isPrivate(req) {
+			tok, err := vendGitHubToken(ctx, e.cc, e.cfg.ControlCenterURL, []string{repoSlug(req.Repo)})
+			if err != nil {
+				fail("github token vend: " + err.Error())
+				return
+			}
+			cloneToken = tok.Token
+			secretFile = dir + ".ghtoken"
+			if err := os.WriteFile(secretFile, []byte(tok.Token), 0o600); err != nil {
+				fail("write token secret: " + err.Error())
+				return
+			}
+			defer os.Remove(secretFile)
+		}
+		if err := e.gitClone(ctx, b, req.Repo, req.Ref, dir, cloneToken); err != nil {
+			fail("git clone: " + err.Error())
 			return
 		}
-		defer os.Remove(secretFile)
-	}
-
-	if err := e.gitClone(ctx, b, req.Repo, req.Ref, dir, cloneToken); err != nil {
-		fail("git clone: " + err.Error())
-		return
 	}
 	if err := e.ensureBuilder(ctx, b); err != nil {
 		fail(err.Error())
