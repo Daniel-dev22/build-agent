@@ -84,12 +84,16 @@ func (a *app) handleJobLogsWS(c *gin.Context) {
 	defer conn.Close()
 	ch, backlog, unsub, ok := a.reg.subscribe(c.Param("id"))
 	if !ok {
-		_ = conn.WriteJSON(gin.H{"type": "error", "error": "job not found"})
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("job not found or no live log"))
 		return
 	}
 	defer unsub()
+	// Frontend JobLogStream expects raw newline-delimited text frames.
+	writeLine := func(line string) bool {
+		return conn.WriteMessage(websocket.TextMessage, []byte(line+"\n")) == nil
+	}
 	for _, line := range backlog {
-		if conn.WriteJSON(gin.H{"type": "line", "line": line}) != nil {
+		if !writeLine(line) {
 			return
 		}
 	}
@@ -109,7 +113,7 @@ func (a *app) handleJobLogsWS(c *gin.Context) {
 			if !open {
 				return
 			}
-			if conn.WriteJSON(gin.H{"type": "line", "line": line}) != nil {
+			if !writeLine(line) {
 				return
 			}
 		case <-ping.C:
