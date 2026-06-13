@@ -59,9 +59,9 @@ func TestVersionTagFor(t *testing.T) {
 
 func TestRepoSlugAndTokenURL(t *testing.T) {
 	cases := map[string]string{
-		"git@github.com:Daniel-dev22/agent-kit-go.git":     "Daniel-dev22/agent-kit-go",
+		"git@github.com:Daniel-dev22/agent-kit-go.git":       "Daniel-dev22/agent-kit-go",
 		"https://github.com/Daniel-dev22/controller.git": "Daniel-dev22/controller",
-		"https://github.com/Daniel-dev22/example-service":  "Daniel-dev22/example-service",
+		"https://github.com/Daniel-dev22/example-service":    "Daniel-dev22/example-service",
 	}
 	for in, want := range cases {
 		if got := repoSlug(in); got != want {
@@ -71,6 +71,54 @@ func TestRepoSlugAndTokenURL(t *testing.T) {
 	url := githubTokenURL("git@github.com:Daniel-dev22/agent-kit-go.git", "TOK")
 	if url != "https://x-access-token:TOK@github.com/Daniel-dev22/agent-kit-go.git" {
 		t.Errorf("token url: %q", url)
+	}
+}
+
+func TestParseBuildxStep(t *testing.T) {
+	cases := []struct {
+		line             string
+		wantOK           bool
+		wantCur, wantTot int
+		wantName         string
+	}{
+		{"#12 [router 4/9] RUN go build ./...", true, 4, 9, "RUN go build ./..."},
+		{"#8 [linux/amd64 builder 3/6] COPY . .", true, 3, 6, "COPY . ."},
+		{"#5 [stage-1 2/2] WORKDIR /app", true, 2, 2, "WORKDIR /app"},
+		// stage label only (no trailing command) falls back to the label.
+		{"#7 [builder 1/6]", true, 1, 6, "builder"},
+		// non-step lines must not match.
+		{"#12 0.521 go: downloading ...", false, 0, 0, ""},
+		{"#12 DONE 2.3s", false, 0, 0, ""},
+		{"#9 CACHED", false, 0, 0, ""},
+		{"#1 [internal] load build definition from Dockerfile", false, 0, 0, ""},
+		{"random log output", false, 0, 0, ""},
+		{"", false, 0, 0, ""},
+	}
+	for _, c := range cases {
+		cur, tot, name, ok := parseBuildxStep(c.line)
+		if ok != c.wantOK {
+			t.Errorf("parseBuildxStep(%q) ok=%v want %v", c.line, ok, c.wantOK)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if cur != c.wantCur || tot != c.wantTot || name != c.wantName {
+			t.Errorf("parseBuildxStep(%q) = (%d,%d,%q) want (%d,%d,%q)",
+				c.line, cur, tot, name, c.wantCur, c.wantTot, c.wantName)
+		}
+	}
+}
+
+// TestParseBuildxStepBounds verifies a very long RUN line is truncated.
+func TestParseBuildxStepBounds(t *testing.T) {
+	long := "RUN " + strings.Repeat("x", 200)
+	_, _, name, ok := parseBuildxStep("#3 [builder 2/5] " + long)
+	if !ok {
+		t.Fatal("expected match")
+	}
+	if len(name) != 80 {
+		t.Errorf("step name not bounded: len=%d", len(name))
 	}
 }
 

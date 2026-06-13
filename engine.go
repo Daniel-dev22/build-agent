@@ -16,11 +16,46 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// buildxStepRe matches buildx `--progress=plain` stage-step lines, e.g.
+//
+//	#12 [router 4/9] RUN go build ./...
+//	#8 [linux/amd64 builder 3/6] COPY . .
+//
+// The stage label (group 1) may carry a platform prefix; the n/m counter is the
+// last token inside the brackets, and the remainder is the step command. Output
+// lines (`#12 0.5 …`), `DONE`/`CACHED`, and `[internal]` vertices don't match.
+var buildxStepRe = regexp.MustCompile(`^#\d+\s+\[(.+?)\s+(\d+)/(\d+)\]\s*(.*)$`)
+
+// parseBuildxStep extracts the current sub-step from one plain-progress line.
+// stepName prefers the command text (e.g. "RUN go build"); it falls back to the
+// stage label and is bounded so a giant RUN line can't bloat the snapshot.
+func parseBuildxStep(line string) (current, total int, stepName string, ok bool) {
+	m := buildxStepRe.FindStringSubmatch(line)
+	if m == nil {
+		return 0, 0, "", false
+	}
+	cur, err1 := strconv.Atoi(m[2])
+	tot, err2 := strconv.Atoi(m[3])
+	if err1 != nil || err2 != nil || tot <= 0 {
+		return 0, 0, "", false
+	}
+	name := strings.TrimSpace(m[4])
+	if name == "" {
+		name = strings.TrimSpace(m[1])
+	}
+	if len(name) > 80 {
+		name = name[:80]
+	}
+	return cur, tot, name, true
+}
 
 type engine struct {
 	cfg Config
@@ -95,7 +130,7 @@ func (e *engine) gitClone(ctx context.Context, b *Build, repo, ref, dir, token s
 	args = append(args, url, dir)
 	cmd := exec.CommandContext(cctx, "git", args...)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	return e.stream(b, "git", cmd)
+	return e.stream(b, "git", cmd, nil)
 }
 
 // ensureBuilder reuses the persistent buildx builder (cache mounts survive); only
@@ -115,7 +150,7 @@ func (e *engine) ensureBuilder(ctx context.Context, b *Build) error {
 			create = append(create, "--buildkitd-config", e.cfg.BuildkitdConfig)
 		}
 	}
-	if err := e.stream(b, "builder", exec.CommandContext(ctx, "docker", create...)); err != nil {
+	if err := e.stream(b, "builder", exec.CommandContext(ctx, "docker", create...), nil); err != nil {
 		return fmt.Errorf("create builder: %w", err)
 	}
 	b.appendLine("[builder] created " + name)
@@ -150,7 +185,7 @@ func (e *engine) boundedGC(ctx context.Context) {
 // buildService runs one service through buildx + tagging + retention. token is
 // passed as a buildx secret (id=ghtoken) so the Dockerfile can `go mod download`
 // private modules. Returns the resulting image repo path on success.
-func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc ServiceSpec, registry, versionTag, apkBust, secretFile string, tagRotation bool, retentionKeep int) (string, error) {
+func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc ServiceSpec, registry, versionTag, apkBust, secretFile string, tagRotation bool, retentionKeep int, notify func()) (string, error) {
 	image := d.ImagePrefix + svc.Name
 	full := registry + "/" + image
 	dockerfile := svc.dockerfile()
@@ -173,7 +208,17 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Dir = b.workdir()
-	if err := e.stream(b, svc.Name, cmd); err != nil {
+	// Parse buildx stage-step lines off the same stream and surface them as a
+	// live indicator. Only a real step change broadcasts (setServiceStep dedupes),
+	// so the coalescing fleet hub sees at most one trigger per step.
+	onLine := func(line string) {
+		if cur, tot, name, ok := parseBuildxStep(line); ok {
+			if b.setServiceStep(svc.Name, cur, tot, name) && notify != nil {
+				notify()
+			}
+		}
+	}
+	if err := e.stream(b, svc.Name, cmd, onLine); err != nil {
 		return "", err
 	}
 	if err := e.tagVersioned(ctx, full, versionTag); err != nil {
@@ -184,8 +229,9 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 }
 
 // stream runs cmd, tees merged stdout+stderr into the build's log ring buffer
-// (prefixed) and returns its exit error.
-func (e *engine) stream(b *Build, prefix string, cmd *exec.Cmd) error {
+// (prefixed) and returns its exit error. onLine, when non-nil, is also called
+// with each raw (unprefixed) line — used by buildService to parse buildx steps.
+func (e *engine) stream(b *Build, prefix string, cmd *exec.Cmd, onLine func(string)) error {
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw
@@ -198,7 +244,11 @@ func (e *engine) stream(b *Build, prefix string, cmd *exec.Cmd) error {
 		sc := bufio.NewScanner(pr)
 		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for sc.Scan() {
-			b.appendLine("[" + prefix + "] " + sc.Text())
+			line := sc.Text()
+			b.appendLine("[" + prefix + "] " + line)
+			if onLine != nil {
+				onLine(line)
+			}
 		}
 		close(done)
 	}()
@@ -221,8 +271,10 @@ func (e *engine) laneSem(d Descriptor) (fast, slow chan struct{}) {
 }
 
 // run orchestrates a whole build invocation, mutating b and notifying via
-// onChange on every lifecycle transition. Blocks until terminal.
-func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange func(JobEvent)) {
+// onChange on every lifecycle transition. notify is a lightweight fleet-only
+// nudge (no controller event) used for live sub-step broadcasts. Blocks until
+// terminal.
+func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange func(JobEvent), notify func()) {
 	d := req.Descriptor
 	registry := req.Registry
 	versionTag := versionTagFor(d, req)
@@ -314,13 +366,16 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			})
 			onChange(EventProgress)
 
-			image, err := e.buildService(ctx, b, d, svc, registry, versionTag, apkBust, secretFile, tagRotation, retentionKeep)
+			image, err := e.buildService(ctx, b, d, svc, registry, versionTag, apkBust, secretFile, tagRotation, retentionKeep, notify)
 			finish := func(sp *ServiceProgress) {
 				now := time.Now().UTC()
 				sp.EndedAt = &now
 				if sp.StartedAt != nil {
 					sp.DurationMs = now.Sub(*sp.StartedAt).Milliseconds()
 				}
+				// Clear the live sub-step indicator — duration is what a finished
+				// service shows; a stale "step 4/9" on a done card would mislead.
+				sp.CurrentStep, sp.TotalSteps, sp.StepName = 0, 0, ""
 			}
 			if err != nil {
 				b.setServiceState(svc.Name, SvcFailed, func(sp *ServiceProgress) { finish(sp); sp.Err = err.Error() })

@@ -31,8 +31,16 @@ func newBuildRegistry(cfg Config, eng *engine, events *eventBuffer) *buildRegist
 	return &buildRegistry{cfg: cfg, eng: eng, events: events, builds: map[string]*Build{}}
 }
 
-func (r *buildRegistry) setHook(h JobEventHook)         { r.hook = h }
+func (r *buildRegistry) setHook(h JobEventHook)            { r.hook = h }
 func (r *buildRegistry) setFleet(f interface{ Trigger() }) { r.fleet = f }
+
+// fleetTrigger is a lightweight fleet-only nudge (no controller event, no
+// persistence) used by the engine to broadcast live buildx sub-step changes.
+func (r *buildRegistry) fleetTrigger() {
+	if r.fleet != nil {
+		r.fleet.Trigger()
+	}
+}
 
 func (r *buildRegistry) onChange(b *Build) func(JobEvent) {
 	return func(evt JobEvent) {
@@ -74,7 +82,7 @@ func (r *buildRegistry) start(parentCtx context.Context, req BuildRequest) *Buil
 		defer cancel()
 		ctx, c2 := context.WithTimeout(jobCtx, r.cfg.BuildTimeout)
 		defer c2()
-		r.eng.run(ctx, b, req, r.onChange(b))
+		r.eng.run(ctx, b, req, r.onChange(b), r.fleetTrigger)
 	}()
 	return b
 }
