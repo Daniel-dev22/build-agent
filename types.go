@@ -142,6 +142,12 @@ type ServiceProgress struct {
 	Image      string       `json:"image,omitempty"`
 	Tag        string       `json:"tag,omitempty"`
 	Err        string       `json:"error,omitempty"`
+	// Live docker buildx sub-step (parsed from --progress=plain `#N [stage n/m]`
+	// lines). A liveness indicator only — meaningful while State==building;
+	// cleared on finish. Total is per buildkit stage, not the whole build.
+	CurrentStep int    `json:"current_step,omitempty"`
+	TotalSteps  int    `json:"total_steps,omitempty"`
+	StepName    string `json:"step_name,omitempty"`
 }
 
 // BuildProgress is the rolled-up progress shown on the job card.
@@ -157,20 +163,20 @@ type BuildProgress struct {
 // buildPublic carries the JSON-serializable fields of a Build, split out so
 // snapshot() can return a lock-free copy without copying the mutex.
 type buildPublic struct {
-	ID         string            `json:"id"`
-	Project    string            `json:"project"`
-	Ref        string            `json:"ref,omitempty"`
-	VersionTag string            `json:"version_tag,omitempty"`
-	Registry   string            `json:"registry,omitempty"`
-	State      BuildState        `json:"state"`
-	Services   []ServiceProgress `json:"services"`
-	Progress   *BuildProgress    `json:"progress,omitempty"`
-	StartedAt  time.Time         `json:"started_at"`
-	CompletedAt time.Time        `json:"completed_at,omitempty"`
-	ExitCode   int               `json:"exit_code"`
-	ErrorMsg   string            `json:"error,omitempty"`
-	LineCount  int               `json:"line_count"`
-	TriggerKey string            `json:"trigger_key,omitempty"`
+	ID          string            `json:"id"`
+	Project     string            `json:"project"`
+	Ref         string            `json:"ref,omitempty"`
+	VersionTag  string            `json:"version_tag,omitempty"`
+	Registry    string            `json:"registry,omitempty"`
+	State       BuildState        `json:"state"`
+	Services    []ServiceProgress `json:"services"`
+	Progress    *BuildProgress    `json:"progress,omitempty"`
+	StartedAt   time.Time         `json:"started_at"`
+	CompletedAt time.Time         `json:"completed_at,omitempty"`
+	ExitCode    int               `json:"exit_code"`
+	ErrorMsg    string            `json:"error,omitempty"`
+	LineCount   int               `json:"line_count"`
+	TriggerKey  string            `json:"trigger_key,omitempty"`
 }
 
 // Build is one build invocation tracked through its lifecycle.
@@ -230,6 +236,32 @@ func (b *Build) setRunning(versionTag, registry string, services []ServiceSpec) 
 	}
 	b.recomputeProgressLocked()
 	b.mu.Unlock()
+}
+
+// setServiceStep updates the live buildx sub-step of a building service. Returns
+// true only when the step actually changed, so callers broadcast at most once
+// per real step transition (the parser sees many lines per step). State is left
+// untouched — this is a liveness annotation, not a lifecycle transition.
+func (b *Build) setServiceStep(name string, current, total int, stepName string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.Services {
+		if b.Services[i].Name != name {
+			continue
+		}
+		if b.Services[i].State != SvcBuilding {
+			return false
+		}
+		if b.Services[i].CurrentStep == current && b.Services[i].TotalSteps == total &&
+			b.Services[i].StepName == stepName {
+			return false
+		}
+		b.Services[i].CurrentStep = current
+		b.Services[i].TotalSteps = total
+		b.Services[i].StepName = stepName
+		return true
+	}
+	return false
 }
 
 func (b *Build) setServiceState(name string, st ServiceState, mutate func(*ServiceProgress)) {
