@@ -41,7 +41,14 @@ type Descriptor struct {
 	TagRotation   *bool             `json:"tag_rotation,omitempty"` // default true
 	RetentionKeep *int              `json:"retention_keep,omitempty"`
 	BuildArgs     map[string]string `json:"build_args,omitempty"` // project-level, inherited
-	Services      []ServiceSpec     `json:"services"`
+	// PreBuild runs these shell commands (via `sh -c`) in the clone workdir before
+	// any service builds — e.g. frigate's `make version` equivalent that stamps
+	// frigate/version.py + web/.env. Descriptors are authored by the trusted caller
+	// (control-api), never by end users; the externally-influenced git ref is passed
+	// to `git clone --branch`, never interpolated into these strings — so there is no
+	// injection surface even though they run through a shell.
+	PreBuild []string      `json:"pre_build,omitempty"`
+	Services []ServiceSpec `json:"services"`
 }
 
 type PlatformSpec struct {
@@ -62,6 +69,7 @@ type ServiceSpec struct {
 	Name       string            `json:"name"`
 	Context    string            `json:"context,omitempty"`    // default "."
 	Dockerfile string            `json:"dockerfile,omitempty"` // default "{name}/Dockerfile"
+	Target     string            `json:"target,omitempty"`     // buildx --target stage; empty = final stage
 	Lane       string            `json:"lane,omitempty"`       // "fast" | "slow"
 	BuildArgs  map[string]string `json:"build_args,omitempty"`
 }
