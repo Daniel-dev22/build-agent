@@ -46,6 +46,30 @@ func TestPlatformArgs(t *testing.T) {
 	}
 }
 
+func TestBuildxArgsTarget(t *testing.T) {
+	d := Descriptor{Platform: PlatformSpec{Mode: "fixed", Value: "linux/amd64"}}
+	// With a target: --target must appear, before the trailing -t/-f/--push tail.
+	svc := ServiceSpec{Name: "frigate", Context: ".", Dockerfile: "docker/main/Dockerfile", Target: "frigate"}
+	args := buildxArgs("cc-builder", d, svc, "reg/frigate", "docker/main/Dockerfile", "20260101-000000", "2026-01", "")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--target frigate") {
+		t.Errorf("expected --target frigate; got %q", joined)
+	}
+	if !strings.Contains(joined, "--platform linux/amd64") {
+		t.Errorf("expected fixed platform; got %q", joined)
+	}
+	ti := strings.Index(joined, "--target")
+	pi := strings.Index(joined, "--push")
+	if ti < 0 || pi < 0 || ti > pi {
+		t.Errorf("--target must precede the --push tail; got %q", joined)
+	}
+	// Without a target: no --target flag at all.
+	none := buildxArgs("cc-builder", d, ServiceSpec{Name: "x", Dockerfile: "x/Dockerfile"}, "reg/x", "x/Dockerfile", "v", "a", "")
+	if strings.Contains(strings.Join(none, " "), "--target") {
+		t.Errorf("no Target => no --target flag; got %q", strings.Join(none, " "))
+	}
+}
+
 func TestVersionTagFor(t *testing.T) {
 	ext := versionTagFor(Descriptor{Version: VersionSpec{Scheme: "external"}}, BuildRequest{Version: "v3.2.1"})
 	if ext != "v3.2.1" {

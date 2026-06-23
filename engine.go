@@ -195,16 +195,7 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 	if tagRotation {
 		e.rotateTags(ctx, full)
 	}
-	args := []string{"buildx", "build", "--builder", e.cfg.Builder, "--progress=plain"}
-	args = append(args, platformArgs(d)...)
-	args = append(args,
-		"--cache-from", "type=registry,ref="+full+":buildcache",
-		"--cache-to", "type=registry,ref="+full+":buildcache,mode=max")
-	args = append(args, renderBuildArgs(d, svc, versionTag, apkBust)...)
-	if secretFile != "" {
-		args = append(args, "--secret", "id=ghtoken,src="+secretFile)
-	}
-	args = append(args, "-t", full+":latest", "-f", dockerfile, "--push", svc.buildContext())
+	args := buildxArgs(e.cfg.Builder, d, svc, full, dockerfile, versionTag, apkBust, secretFile)
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Dir = b.workdir()
@@ -226,6 +217,47 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 	}
 	e.reg.pruneOldTags(ctx, registry, image, retentionKeep)
 	return image, nil
+}
+
+// buildxArgs assembles the `docker buildx build ...` argument vector for one
+// service. Pure (no exec) so the arg ordering — platform, cache, build-args,
+// optional --target, optional ghtoken secret, and the trailing -t/-f/--push
+// context — is unit-testable.
+func buildxArgs(builder string, d Descriptor, svc ServiceSpec, full, dockerfile, versionTag, apkBust, secretFile string) []string {
+	args := []string{"buildx", "build", "--builder", builder, "--progress=plain"}
+	args = append(args, platformArgs(d)...)
+	args = append(args,
+		"--cache-from", "type=registry,ref="+full+":buildcache",
+		"--cache-to", "type=registry,ref="+full+":buildcache,mode=max")
+	args = append(args, renderBuildArgs(d, svc, versionTag, apkBust)...)
+	if svc.Target != "" {
+		args = append(args, "--target", svc.Target)
+	}
+	if secretFile != "" {
+		args = append(args, "--secret", "id=ghtoken,src="+secretFile)
+	}
+	args = append(args, "-t", full+":latest", "-f", dockerfile, "--push", svc.buildContext())
+	return args
+}
+
+// runPreBuild executes the descriptor's PreBuild commands sequentially in the
+// build workdir, streaming each command's output into the build log (prefix
+// "prebuild"). Commands run via `sh -c` so they can use shell features (pipes,
+// $(git rev-parse ...), redirection). Bounded by GitTimeout per command — these
+// are quick source-stamping steps, not builds. Returns on the first failure.
+func (e *engine) runPreBuild(ctx context.Context, b *Build, cmds []string) error {
+	for _, c := range cmds {
+		cctx, cancel := context.WithTimeout(ctx, e.cfg.GitTimeout)
+		cmd := exec.CommandContext(cctx, "sh", "-c", c)
+		cmd.Dir = b.workdir()
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		err := e.stream(b, "prebuild", cmd, nil)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("%q: %w", c, err)
+		}
+	}
+	return nil
 }
 
 // stream runs cmd, tees merged stdout+stderr into the build's log ring buffer
@@ -328,6 +360,15 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 	}
 	if err := e.ensureBuilder(ctx, b); err != nil {
 		fail(err.Error())
+		return
+	}
+
+	// Project pre-build hook: run the descriptor's PreBuild commands in the freshly
+	// populated workdir before any service builds (e.g. frigate's `make version`
+	// equivalent that stamps frigate/version.py + web/.env). Fail the whole build if
+	// any command errors — a missing version stamp would produce a broken image.
+	if err := e.runPreBuild(ctx, b, d.PreBuild); err != nil {
+		fail("pre-build: " + err.Error())
 		return
 	}
 
