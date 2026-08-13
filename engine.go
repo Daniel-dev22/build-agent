@@ -1,10 +1,11 @@
 package main
 
-// engine ports build_orchestrator.py's build logic to Go: clone repo@ref, ensure
-// the persistent buildx builder, validate/bust registry caches, build each
-// service via `docker buildx` under fast/slow lane semaphores, rotate + version
-// tags, prune retention, and bounded-GC. State mutations on the Build flow back
-// to the controller + fleet via the onChange callback supplied by the registry.
+// engine runs one build invocation end to end: clone repo@ref (or extract an
+// uploaded context), ensure the persistent buildx builder, validate/bust registry
+// caches, build each service via `docker buildx` under fast/slow lane semaphores,
+// rotate + version tags, prune retention, and bounded-GC. State mutations on the
+// Build flow back to the controller + fleet via the onChange callback supplied by
+// the registry.
 
 import (
 	"bufio"
@@ -79,8 +80,8 @@ func nativePlatform() string {
 }
 
 // platformArgs: a fixed-platform descriptor wins; else multi-arch (auto) fans out
-// to amd64+arm64; the agent defaults auto→multi-arch since builds push to a
-// multi-arch registry (matches the orchestrator's --multi-arch default in vars).
+// to amd64+arm64. The agent defaults auto→multi-arch because builds are pushed to
+// a registry that serves both architectures.
 func platformArgs(d Descriptor) []string {
 	if d.Platform.Mode == "fixed" && d.Platform.Value != "" {
 		return []string{"--platform", d.Platform.Value}
@@ -310,24 +311,27 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 	d := req.Descriptor
 	registry := req.Registry
 	versionTag := versionTagFor(d, req)
-	apkBust := time.Now().UTC().Format("2006-01") // bucket; orchestrator used ISO year-week
+	apkBust := time.Now().UTC().Format("2006-01") // coarse monthly cache-bust bucket
 	services := selectServices(d, req.Services)
 
 	b.setRunning(versionTag, registry, services)
 	onChange(EventStarted)
 
+	// dir holds the build context (clone / uploaded tar); the job root above it
+	// holds anything that must NOT be shipped to buildkit as context (the token
+	// secret). Removing the root cleans up both, whatever the exit path.
 	dir := b.workdir()
-	defer os.RemoveAll(dir)
+	defer os.RemoveAll(b.jobRoot())
 
 	fail := func(msg string) {
 		b.markFailed(msg)
 		onChange(EventFailed)
 	}
 
-	// Context source: an uploaded inline context (genmon-style) extracts into the
-	// workdir; otherwise the agent clones repo@ref. Token vend only applies to the
-	// clone path — an uploaded context never needs git auth, so secretFile stays
-	// empty and buildService skips the buildx secret.
+	// Context source: an uploaded inline context extracts into the workdir;
+	// otherwise the agent clones repo@ref. Token vend only applies to the clone
+	// path — an uploaded context never needs git auth, so secretFile stays empty
+	// and buildService skips the buildx secret.
 	var secretFile string
 	if req.ContextB64 != "" {
 		if err := extractContextTarGz(req.ContextB64, dir); err != nil {
@@ -335,18 +339,23 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			return
 		}
 	} else {
-		// Private repos vend a short-lived GitHub App installation token from
+		// Private repos vend a short-lived GitHub App installation token from the
 		// controller; it is used for the clone URL and as a buildx secret for
 		// `go mod download` of private modules. Never written into the clone.
 		var cloneToken string
-		if isPrivate(req) {
+		if isPrivate(req, e.cfg.PrivateRepoOwners) {
 			tok, err := vendGitHubToken(ctx, e.cc, e.cfg.ControlCenterURL, []string{repoSlug(req.Repo)})
 			if err != nil {
 				fail("github token vend: " + err.Error())
 				return
 			}
 			cloneToken = tok.Token
-			secretFile = dir + ".ghtoken"
+			// Inside the job root so the deferred RemoveAll above always covers it:
+			// a path outside it would survive a kill between this write and the
+			// os.Remove below, leaving a live token on disk under WORK_DIR. It sits
+			// beside — not inside — the context dir, so buildkit never receives it
+			// as context; the Dockerfile gets it only via --secret id=ghtoken.
+			secretFile = filepath.Join(b.jobRoot(), ".ghtoken")
 			if err := os.WriteFile(secretFile, []byte(tok.Token), 0o600); err != nil {
 				fail("write token secret: " + err.Error())
 				return
@@ -364,9 +373,9 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 	}
 
 	// Project pre-build hook: run the descriptor's PreBuild commands in the freshly
-	// populated workdir before any service builds (e.g. frigate's `make version`
-	// equivalent that stamps frigate/version.py + web/.env). Fail the whole build if
-	// any command errors — a missing version stamp would produce a broken image.
+	// populated workdir before any service builds — e.g. a `make version` step that
+	// stamps a generated version file the Dockerfile then copies in. Fail the whole
+	// build if any command errors; a missing stamp would produce a broken image.
 	if err := e.runPreBuild(ctx, b, d.PreBuild); err != nil {
 		fail("pre-build: " + err.Error())
 		return
@@ -468,13 +477,22 @@ func selectServices(d Descriptor, want []string) []ServiceSpec {
 	return out
 }
 
-// isPrivate decides whether to vend a token. Explicit req.Private wins; else our
-// org's repos are treated as private.
-func isPrivate(req BuildRequest) bool {
+// isPrivate decides whether to vend a token. Explicit req.Private wins; otherwise
+// the repo is inferred private when its URL names one of the configured owners
+// (PRIVATE_REPO_OWNERS). An empty owner list means nothing is inferred private.
+func isPrivate(req BuildRequest, owners []string) bool {
 	if req.Private != nil {
 		return *req.Private
 	}
-	return strings.Contains(req.Repo, "Daniel-dev22/")
+	for _, o := range owners {
+		if o == "" {
+			continue
+		}
+		if strings.Contains(req.Repo, o+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // repoSlug extracts "owner/repo" from an ssh or https git URL

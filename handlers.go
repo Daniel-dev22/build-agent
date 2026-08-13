@@ -38,7 +38,7 @@ func (a *app) handleTriggerBuild(c *gin.Context) {
 		return
 	}
 	if req.TriggerKey == "" {
-		req.TriggerKey = "ansible"
+		req.TriggerKey = "api"
 	}
 	b := a.reg.start(context.Background(), req)
 	c.JSON(http.StatusAccepted, gin.H{"job_id": b.ID, "state": b.snapshot().State})

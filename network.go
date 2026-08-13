@@ -1,10 +1,10 @@
 package main
 
-// Process-global pooled HTTP client for every agent → controller call
-// (event push via the kit outbox, reconcile, GitHub installation-token vend).
+// Process-global pooled HTTP client for every agent → controller call (event push
+// via the kit outbox, reconcile, GitHub installation-token vend).
 //
-// Auth model (identical to duplicacy/gdrive): transport mTLS is handled at the
-// Traefik boundary on each side; the agent presents NO client cert. Per-node
+// Auth model: transport security (mTLS) is expected to be handled by the reverse
+// proxies on each side; the agent presents NO client cert. Its own per-node
 // identity is the BearerToken header attached by the round-tripper below.
 
 import (
@@ -44,11 +44,12 @@ func (b *bearerAuthRoundTripper) RoundTrip(r *http.Request) (*http.Response, err
 	return b.rt.RoundTrip(r)
 }
 
-// buildControlCenterClient returns the pooled HTTP client. Direct mode (k3s,
-// TraefikDockerDNS=="") dials the URL host normally; Traefik-rewrite mode (NAS,
-// TraefikDockerDNS!="") rewrites the dial target to the local docker Traefik
-// while keeping the URL host as TLS SNI, so the host's mTLS ServersTransport
-// attaches the cluster identity.
+// buildControlCenterClient returns the pooled HTTP client. Direct mode
+// (TraefikDockerDNS=="") dials the URL host normally; rewrite mode
+// (TraefikDockerDNS!="") rewrites the dial target to a local reverse-proxy
+// container while keeping the URL host as the Host header and TLS SNI, so that
+// proxy can match its routing rule and attach the client certificate on the way
+// out. The agent itself never holds a certificate.
 func buildControlCenterClient(cfg Config) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
 	transport := &http.Transport{
@@ -70,7 +71,7 @@ func buildControlCenterClient(cfg Config) *http.Client {
 	}
 }
 
-// githubTokenResp is controller's response from POST /api/build/github-token:
+// githubTokenResp is the controller's response to POST /api/build/github-token:
 // a short-lived GitHub App installation token the agent uses for `git clone` and
 // (as a buildx secret) `go mod download` of private modules.
 type githubTokenResp struct {
@@ -78,7 +79,7 @@ type githubTokenResp struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// vendGitHubToken asks controller to mint an installation token for the
+// vendGitHubToken asks the controller to mint an installation token for the
 // given repos. Returns ("", nil) is never used — a missing token is an error;
 // callers only invoke this for private builds. Transient failures retry within
 // ctx; auth/permission failures short-circuit.

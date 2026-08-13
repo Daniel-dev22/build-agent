@@ -15,9 +15,8 @@ import (
 	_ "modernc.org/sqlite" // pure-Go sqlite driver, works with CGO_ENABLED=0
 )
 
-// EventPayload is the body POSTed to controller on every build lifecycle
-// transition. The router deserializes the same shape into build_jobs /
-// build_job_events.
+// EventPayload is the body POSTed to the controller on every build lifecycle
+// transition. The controller is expected to deserialize this exact shape.
 type EventPayload struct {
 	JobID       string            `json:"job_id"`
 	Site        string            `json:"site"`
@@ -116,7 +115,7 @@ func (e *eventBuffer) close() {
 }
 
 // handleJobEvent is the JobEventHook: persist to the local builds table
-// (restart-survival) and enqueue for durable delivery to controller.
+// (restart-survival) and enqueue for durable delivery to the controller.
 func (e *eventBuffer) handleJobEvent(b *Build, evt JobEvent) {
 	snap := b.snapshot()
 	payload := EventPayload{

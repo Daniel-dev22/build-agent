@@ -7,7 +7,7 @@ import (
 
 func TestRenderBuildArgsTemplating(t *testing.T) {
 	d := Descriptor{
-		ImagePrefix: "controller-",
+		ImagePrefix: "acme-",
 		BuildArgs:   map[string]string{"APK_CACHE_BUST": "${APK_CACHE_BUST}", "SERVICE_DIR": "${SERVICE_DIR}"},
 	}
 	svc := ServiceSpec{Name: "mock-publisher", Dockerfile: "tools/mock-publisher/Dockerfile",
@@ -49,11 +49,11 @@ func TestPlatformArgs(t *testing.T) {
 func TestBuildxArgsTarget(t *testing.T) {
 	d := Descriptor{Platform: PlatformSpec{Mode: "fixed", Value: "linux/amd64"}}
 	// With a target: --target must appear, before the trailing -t/-f/--push tail.
-	svc := ServiceSpec{Name: "frigate", Context: ".", Dockerfile: "docker/main/Dockerfile", Target: "frigate"}
-	args := buildxArgs("cc-builder", d, svc, "reg/frigate", "docker/main/Dockerfile", "20260101-000000", "2026-01", "")
+	svc := ServiceSpec{Name: "app", Context: ".", Dockerfile: "docker/main/Dockerfile", Target: "runtime"}
+	args := buildxArgs("test-builder", d, svc, "reg/app", "docker/main/Dockerfile", "20260101-000000", "2026-01", "")
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--target frigate") {
-		t.Errorf("expected --target frigate; got %q", joined)
+	if !strings.Contains(joined, "--target runtime") {
+		t.Errorf("expected --target runtime; got %q", joined)
 	}
 	if !strings.Contains(joined, "--platform linux/amd64") {
 		t.Errorf("expected fixed platform; got %q", joined)
@@ -64,7 +64,7 @@ func TestBuildxArgsTarget(t *testing.T) {
 		t.Errorf("--target must precede the --push tail; got %q", joined)
 	}
 	// Without a target: no --target flag at all.
-	none := buildxArgs("cc-builder", d, ServiceSpec{Name: "x", Dockerfile: "x/Dockerfile"}, "reg/x", "x/Dockerfile", "v", "a", "")
+	none := buildxArgs("test-builder", d, ServiceSpec{Name: "x", Dockerfile: "x/Dockerfile"}, "reg/x", "x/Dockerfile", "v", "a", "")
 	if strings.Contains(strings.Join(none, " "), "--target") {
 		t.Errorf("no Target => no --target flag; got %q", strings.Join(none, " "))
 	}
@@ -83,17 +83,17 @@ func TestVersionTagFor(t *testing.T) {
 
 func TestRepoSlugAndTokenURL(t *testing.T) {
 	cases := map[string]string{
-		"git@github.com:Daniel-dev22/agent-kit-go.git":       "Daniel-dev22/agent-kit-go",
-		"https://github.com/Daniel-dev22/controller.git": "Daniel-dev22/controller",
-		"https://github.com/Daniel-dev22/example-service":    "Daniel-dev22/example-service",
+		"git@github.com:example-org/example-repo.git":         "example-org/example-repo",
+		"https://github.com/example-org/another-repo.git":     "example-org/another-repo",
+		"https://github.com/example-org/repo_with_underscore": "example-org/repo_with_underscore",
 	}
 	for in, want := range cases {
 		if got := repoSlug(in); got != want {
 			t.Errorf("repoSlug(%q)=%q want %q", in, got, want)
 		}
 	}
-	url := githubTokenURL("git@github.com:Daniel-dev22/agent-kit-go.git", "TOK")
-	if url != "https://x-access-token:TOK@github.com/Daniel-dev22/agent-kit-go.git" {
+	url := githubTokenURL("git@github.com:example-org/example-repo.git", "TOK")
+	if url != "https://x-access-token:TOK@github.com/example-org/example-repo.git" {
 		t.Errorf("token url: %q", url)
 	}
 }
@@ -149,13 +149,30 @@ func TestParseBuildxStepBounds(t *testing.T) {
 func TestIsPrivate(t *testing.T) {
 	yes := true
 	no := false
-	if !isPrivate(BuildRequest{Repo: "git@github.com:Daniel-dev22/x.git"}) {
-		t.Error("org repo should infer private")
+	owners := []string{"example-org", "other-org"}
+
+	if !isPrivate(BuildRequest{Repo: "git@github.com:example-org/x.git"}, owners) {
+		t.Error("a configured owner's repo should infer private")
 	}
-	if isPrivate(BuildRequest{Repo: "https://github.com/public/x", Private: &no}) {
+	if !isPrivate(BuildRequest{Repo: "https://github.com/other-org/x"}, owners) {
+		t.Error("every configured owner counts, not just the first")
+	}
+	if isPrivate(BuildRequest{Repo: "https://github.com/public/x"}, owners) {
+		t.Error("an unlisted owner must not infer private")
+	}
+	// An empty owner list is the default: nothing is inferred private.
+	if isPrivate(BuildRequest{Repo: "git@github.com:example-org/x.git"}, nil) {
+		t.Error("empty owner list must infer nothing private")
+	}
+	// A bare substring must not match — the owner is matched with its slash.
+	if isPrivate(BuildRequest{Repo: "https://github.com/someone/example-org-mirror"}, owners) {
+		t.Error("owner must match as a path segment, not a substring")
+	}
+	// Explicit Private always wins over inference, in both directions.
+	if isPrivate(BuildRequest{Repo: "git@github.com:example-org/x.git", Private: &no}, owners) {
 		t.Error("explicit private=false wins")
 	}
-	if !isPrivate(BuildRequest{Repo: "https://github.com/public/x", Private: &yes}) {
+	if !isPrivate(BuildRequest{Repo: "https://github.com/public/x", Private: &yes}, nil) {
 		t.Error("explicit private=true wins")
 	}
 }

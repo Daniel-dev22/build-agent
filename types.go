@@ -7,17 +7,17 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Wire contract: the POST /v1/builds body. The repo's build.json IS the
-// descriptor; ansible adds repo/ref/registry/version/services/private on top.
+// Wire contract: the POST /v1/builds body. The target repo's build.json IS the
+// descriptor; the caller adds repo/ref/registry/version/services/private on top.
 // ---------------------------------------------------------------------------
 
 // BuildRequest is the trigger body. Descriptor is the repo's build.json verbatim.
 //
 // The build context comes from EITHER Repo/Ref (the agent clones repo@ref) OR
 // ContextB64 (the caller uploads the context inline). The latter is for projects
-// whose Dockerfile/context isn't in a standalone cloneable repo — e.g. genmon,
-// whose context lives in the ansible repo's genmon/image/ dir. Exactly one source
-// is required.
+// whose Dockerfile/context isn't in a standalone cloneable repo — e.g. an image
+// whose context lives in a subdirectory of some larger, unrelated repo. Exactly
+// one source is required.
 type BuildRequest struct {
 	Descriptor Descriptor `json:"descriptor"`
 	Repo       string     `json:"repo"`                  // git URL (ssh or https form)
@@ -30,7 +30,8 @@ type BuildRequest struct {
 	TriggerKey string     `json:"trigger_key,omitempty"`
 }
 
-// Descriptor mirrors the per-repo build.json the Python orchestrator consumes.
+// Descriptor mirrors the per-repo build.json checked in beside the services it
+// describes.
 type Descriptor struct {
 	Project       string            `json:"project"`
 	ImagePrefix   string            `json:"image_prefix"`
@@ -42,11 +43,12 @@ type Descriptor struct {
 	RetentionKeep *int              `json:"retention_keep,omitempty"`
 	BuildArgs     map[string]string `json:"build_args,omitempty"` // project-level, inherited
 	// PreBuild runs these shell commands (via `sh -c`) in the clone workdir before
-	// any service builds — e.g. frigate's `make version` equivalent that stamps
-	// frigate/version.py + web/.env. Descriptors are authored by the trusted caller
-	// (control-api), never by end users; the externally-influenced git ref is passed
-	// to `git clone --branch`, never interpolated into these strings — so there is no
-	// injection surface even though they run through a shell.
+	// any service builds — e.g. a `make version` step that stamps a generated
+	// version file. Descriptors are expected to be authored by the trusted caller,
+	// never by end users; the externally-influenced git ref is passed to
+	// `git clone --branch` and never interpolated into these strings — so there is
+	// no injection surface even though they run through a shell. Do NOT expose
+	// descriptor authoring to untrusted input: these commands are arbitrary code.
 	PreBuild []string      `json:"pre_build,omitempty"`
 	Services []ServiceSpec `json:"services"`
 }
@@ -193,15 +195,26 @@ type Build struct {
 
 	mu          sync.Mutex
 	cancel      context.CancelFunc
-	dir         string // per-build clone/context dir under cfg.WorkDir
+	root        string // per-build scratch root under cfg.WorkDir; removed when the build ends
+	dir         string // clone/context dir inside root — this IS the docker build context
 	ringBuffer  []string
 	subscribers map[chan string]struct{}
 }
 
+// workdir is the build context directory: what git clones into, what an uploaded
+// context extracts into, and what buildx is handed as its context.
 func (b *Build) workdir() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.dir
+}
+
+// jobRoot is the parent of workdir. Files placed here (e.g. the short-lived
+// GitHub token secret) are cleaned up with the job but never reach buildkit.
+func (b *Build) jobRoot() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.root
 }
 
 // recomputeProgressLocked rolls per-service states up into Progress. Caller holds b.mu.
