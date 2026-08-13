@@ -12,8 +12,8 @@ import (
 
 // buildRegistry owns in-flight Builds, drives the engine, and fans lifecycle
 // changes out to the event hook (durable outbox) + fleet hub. It is the single
-// entry point, so its in-process lane scheduling (inside engine.run) replaces
-// the Python orchestrator's cross-process FIFO.
+// entry point for starting a build, so the in-process lane semaphores inside
+// engine.run are sufficient to bound concurrency — no cross-process lock needed.
 type buildRegistry struct {
 	cfg    Config
 	eng    *engine
@@ -56,10 +56,14 @@ func (r *buildRegistry) onChange(b *Build) func(JobEvent) {
 }
 
 // start registers a new build and runs it in the background. Returns immediately
-// with the job id so the trigger caller (ansible) can poll.
+// with the job id so the caller can poll or subscribe to the log stream.
 func (r *buildRegistry) start(parentCtx context.Context, req BuildRequest) *Build {
 	id := uuid.NewString()
-	dir := filepath.Join(r.cfg.WorkDir, id)
+	// <WorkDir>/<id> is the job root; the build context is <WorkDir>/<id>/src, so
+	// per-job secrets can live in the root without entering the docker context.
+	// git clone requires an empty destination, which src is.
+	root := filepath.Join(r.cfg.WorkDir, id)
+	dir := filepath.Join(root, "src")
 	_ = os.MkdirAll(dir, 0o700)
 
 	jobCtx, cancel := context.WithCancel(parentCtx)
@@ -69,6 +73,7 @@ func (r *buildRegistry) start(parentCtx context.Context, req BuildRequest) *Buil
 			Registry: req.Registry, State: BuildPending, TriggerKey: req.TriggerKey,
 		},
 		cancel:      cancel,
+		root:        root,
 		dir:         dir,
 		subscribers: map[chan string]struct{}{},
 	}
@@ -119,7 +124,9 @@ func (r *buildRegistry) cancelJob(id string) bool {
 }
 
 // list merges active in-memory builds with recent persisted builds (in-memory
-// wins on id collision), newest first.
+// wins on id collision). The result is NOT globally sorted: the in-memory half
+// comes out in map order and is simply prepended to the newest-first persisted
+// half. Callers that need an order must sort by started_at themselves.
 func (r *buildRegistry) list() []buildPublic {
 	r.mu.Lock()
 	active := make([]buildPublic, 0, len(r.builds))

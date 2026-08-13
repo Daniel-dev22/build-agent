@@ -17,8 +17,8 @@ type hostInfo struct {
 	NumCPU int    `json:"num_cpu"`
 }
 
-// buildSnapshot is what the dashboard renders per host (mirrors duplicacy's
-// {host, repos, jobs} shape as {host, builds}).
+// buildSnapshot is what a dashboard renders per host: who this agent is, plus
+// its current and recent builds.
 type buildSnapshot struct {
 	Host   hostInfo      `json:"host"`
 	Builds []buildPublic `json:"builds"`

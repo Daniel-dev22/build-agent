@@ -1,4 +1,4 @@
-module build-agent
+module github.com/Daniel-dev22/build-agent
 
 go 1.26
 

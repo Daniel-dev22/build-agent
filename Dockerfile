@@ -1,13 +1,21 @@
 # syntax=docker/dockerfile:1.7
-# Build-agent: orchestrates `docker buildx` + `git` on the NAS and reports build
-# jobs to controller. The runtime needs the docker CLI + buildx plugin + git
-# (it shells out to them against the host docker socket).
+# build-agent image.
 #
-# NOTE: this image is BOOTSTRAPPED by the Python orchestrator, which fetches the
-# private agent-kit-go module over SSH (--mount=type=ssh). Once the build-agent
-# is running it builds every OTHER repo with a GitHub App installation token
-# (--mount=type=secret=ghtoken, see engine.go) — the SSH path here is only the
-# self-bootstrap. Phase 3 converts this to the token path too.
+# Stage 1 (builder) compiles the static, CGO-free binary, cross-compiling to
+# ${TARGETARCH} so multi-arch builds never run the Go toolchain under emulation.
+# Stage 2 is the runtime: it needs the docker CLI + buildx plugin + git, because
+# the agent shells out to them against the host's mounted docker socket.
+#
+# The builder fetches github.com/Daniel-dev22/agent-kit-go, which is still a
+# PRIVATE module — hence GOPRIVATE, the SSH url rewrite, and `--mount=type=ssh`
+# on `go mod download` (build with `docker buildx build --ssh default`). No key
+# is ever copied into a layer. `go build ./...` on the host needs none of this
+# once the module is in your module cache; see the README. When agent-kit-go is
+# published these four lines can be deleted.
+#
+# Unrelated to the above: at RUNTIME the agent builds OTHER private repos using a
+# GitHub App installation token vended by the controller and passed to buildx as
+# `--secret id=ghtoken` (see engine.go) — not over SSH.
 FROM golang:1.26-alpine AS builder
 RUN apk add --no-cache git openssh-client ca-certificates
 WORKDIR /app

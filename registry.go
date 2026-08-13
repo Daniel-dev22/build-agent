@@ -1,8 +1,8 @@
 package main
 
-// Native Go port of the Python orchestrator's registry interactions — buildcache
-// validation/bust + timestamp-tag retention — via the registry v2 HTTP API
-// (faster than shelling out to curl). Tag rotation + versioned tagging stay as
+// Registry-side housekeeping — buildcache validation/bust + timestamp-tag
+// retention — done directly over the registry v2 HTTP API (much faster than
+// shelling out per request). Tag rotation + versioned tagging stay on
 // `docker buildx imagetools` (os/exec) since they re-publish manifests.
 
 import (
@@ -26,8 +26,10 @@ const manifestAccept = "application/vnd.oci.image.index.v1+json," +
 	"application/vnd.docker.distribution.manifest.list.v2+json," +
 	"application/vnd.docker.distribution.manifest.v2+json"
 
-// registryClient performs unauthenticated v2 API calls against the in-cluster
-// registry (reachable from the NAS over the same Traefik path as buildx push).
+// registryClient performs UNAUTHENTICATED v2 API calls against the target
+// registry, over the same network path buildx pushes through. It sends no
+// credentials, so the registry must either allow anonymous read+delete from this
+// host or these best-effort calls simply no-op.
 type registryClient struct {
 	hc *http.Client
 }

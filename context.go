@@ -14,23 +14,25 @@ import (
 // Inline build-context upload (BuildRequest.ContextB64).
 //
 // Some projects' Dockerfile + context don't live in a standalone cloneable repo
-// (genmon's are in the ansible repo's genmon/image/ dir). Rather than clone an
-// unrelated repo, the caller uploads the context as base64(gzip(tar)) and the
-// agent extracts it into the per-job workdir instead of cloning.
+// (they sit in a subdirectory of a larger, unrelated repo). Rather than clone
+// that repo, the caller uploads the context as base64(gzip(tar)) and the agent
+// extracts it into the per-job workdir instead of cloning.
 //
-// SECURITY: the agent's /v1/builds endpoint is cluster-internal (reached only
-// through the router's mTLS proxy by an operator with kubectl access) and the
-// agent already runs arbitrary Dockerfiles with docker-socket access, so the
-// upload adds no new code-exec surface beyond the clone path. The ONE new
-// surface is untarring attacker/operator-supplied bytes, so the extractor is
-// hardened against the classic archive attacks:
+// SECURITY: this endpoint has NO inbound authentication of its own. It is a
+// DEPLOYMENT REQUIREMENT that /v1/builds is reachable only by trusted callers —
+// bind it to a private network and put an authenticating reverse proxy (mTLS or
+// equivalent) in front of it. Given that assumption the upload adds no code-exec
+// surface beyond the clone path, since the agent already runs arbitrary
+// Dockerfiles with docker-socket access either way. The ONE genuinely new
+// surface is untarring caller-supplied bytes, so the extractor is hardened
+// against the classic archive attacks:
 //   - path traversal / zip-slip: every entry must resolve inside destDir.
 //   - symlink/hardlink escape: links are rejected outright (a build context has
 //     no need for them, and validating link targets safely is error-prone).
 //   - special files: only regular files + dirs are written.
 //   - decompression bombs: total uncompressed bytes and entry count are capped.
 const (
-	maxContextBytes   = 64 << 20 // 64 MiB uncompressed — contexts are tiny (genmon ~5 KiB)
+	maxContextBytes   = 64 << 20 // 64 MiB uncompressed — real contexts are tiny (a few KiB)
 	maxContextEntries = 10000
 )
 

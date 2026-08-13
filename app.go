@@ -44,8 +44,8 @@ func (a *app) close() {
 }
 
 func (a *app) startBackgroundWorkers(ctx context.Context) {
-	a.events.Start(ctx)   // outbox drain
-	go a.fleet.Run(ctx)   // fleet broadcaster
+	a.events.Start(ctx) // outbox drain
+	go a.fleet.Run(ctx) // fleet broadcaster
 	go a.startReconcile(ctx)
 }
 

@@ -10,31 +10,37 @@ import (
 
 // Config is the build-agent runtime config, loaded from env at startup.
 //
-// The agent reaches controller exactly like duplicacy/gdrive: transport mTLS
-// is attached by the local docker Traefik (NAS) or k3s Traefik (cluster node);
-// app-layer identity is the per-host BearerToken. It NEVER holds a client cert.
+// The agent holds no client certificate. Transport security (mTLS) is expected
+// to be terminated by a reverse proxy in front of it and attached on the way out
+// by the proxy the agent dials; the agent's own application-layer identity to the
+// controller is the per-host BearerToken.
 type Config struct {
-	NodeName string // hostname-short this agent runs on (e.g. "nas")
-	SiteID   string // "kd" | "ng"
+	NodeName string // short hostname this agent runs on (e.g. "builder01")
+	SiteID   string // logical site/region this node belongs to (e.g. "site-a")
 
 	ConfigDir string // persistent state dir (events.sqlite, job logs)
 	WorkDir   string // scratch dir for cloned repos + build contexts
 
-	ControlCenterURL string // https://controller-api.<domain>:1443
-	TraefikDockerDNS string // docker DNS name → local Traefik ("traefik" on NAS; "" = direct on k3s)
-	TraefikDialPort  string // port on the resolved Traefik IP (default "1443")
+	ControlCenterURL string // base URL of the controller, e.g. https://controller.example.com:1443
+	TraefikDockerDNS string // docker DNS name of the local reverse proxy; "" = dial the URL host directly
+	TraefikDialPort  string // port on the resolved proxy IP (default "1443")
 
 	BearerTokenFile string // per-host bearer token file (mode 0600, bind-mounted)
 	BearerToken     string // populated at startup from BearerTokenFile
 
 	// Builder / buildx
-	Builder         string        // persistent buildx builder name (default "build-agent-builder")
-	BuildkitdConfig string        // optional path to buildkitd.toml (GC bounds); "" = none
-	FastLane        int           // concurrent fast-lane (Go) service builds
-	SlowLane        int           // concurrent slow-lane (frontend) service builds
-	RetentionKeepDefault int      // default retention when a descriptor omits it
-	GitTimeout      time.Duration // per-clone timeout
-	BuildTimeout    time.Duration // hard ceiling per build job
+	Builder              string        // persistent buildx builder name (default "build-agent-builder")
+	BuildkitdConfig      string        // optional path to buildkitd.toml (GC bounds); "" = none
+	FastLane             int           // concurrent fast-lane (Go) service builds
+	SlowLane             int           // concurrent slow-lane (frontend) service builds
+	RetentionKeepDefault int           // default retention when a descriptor omits it
+	GitTimeout           time.Duration // per-clone timeout
+	BuildTimeout         time.Duration // hard ceiling per build job
+
+	// PrivateRepoOwners lists GitHub owners/orgs whose repos are treated as
+	// private (⇒ vend an installation token) when BuildRequest.Private is unset.
+	// Empty (the default) ⇒ nothing is inferred private.
+	PrivateRepoOwners []string
 }
 
 func loadConfig() Config {
@@ -46,9 +52,10 @@ func loadConfig() Config {
 		WorkDir:   getEnv("WORK_DIR", "/var/lib/build-agent/work"),
 
 		ControlCenterURL: requireEnv("CONTROL_CENTER_URL"),
-		// Empty default — k3s nodes use direct mode; NAS hosts set "traefik" to
-		// opt into rewrite mode (see network.go). A non-empty default would break
-		// k3s nodes the way it did for the other agents.
+		// Empty default — dial the controller URL's own host. Hosts that reach the
+		// controller through a local reverse-proxy container set this to that
+		// container's DNS name to opt into rewrite mode (see network.go). A
+		// non-empty default would break every host that dials directly.
 		TraefikDockerDNS: getEnv("TRAEFIK_DOCKER_DNS", ""),
 		TraefikDialPort:  getEnv("TRAEFIK_DIAL_PORT", "1443"),
 
@@ -61,6 +68,7 @@ func loadConfig() Config {
 		RetentionKeepDefault: getEnvInt("REGISTRY_RETENTION_KEEP", 15),
 		GitTimeout:           getEnvDuration("GIT_TIMEOUT", 5*time.Minute),
 		BuildTimeout:         getEnvDuration("BUILD_TIMEOUT", 60*time.Minute),
+		PrivateRepoOwners:    getEnvList("PRIVATE_REPO_OWNERS"),
 	}
 	tok, err := readBearerToken(cfg.BearerTokenFile)
 	if err != nil {
@@ -102,6 +110,18 @@ func getEnv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// getEnvList parses a comma-separated env var into a slice, trimming whitespace
+// and dropping empty elements. An unset/blank var yields a nil slice.
+func getEnvList(k string) []string {
+	var out []string
+	for _, part := range strings.Split(os.Getenv(k), ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func getEnvInt(k string, def int) int {
