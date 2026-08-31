@@ -175,12 +175,20 @@ func (e *engine) tagVersioned(ctx context.Context, full, tag string) error {
 }
 
 func (e *engine) boundedGC(ctx context.Context) {
+	start := time.Now()
 	cmd := exec.CommandContext(ctx, "docker", "buildx", "prune", "--builder", e.cfg.Builder, "--force",
 		"--reserved-space", "10GB", "--max-used-space", "40GB", "--min-free-space", "20GB",
 		"--filter", "until=168h")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		slog.Warn("bounded gc", "error", err, "out", strings.TrimSpace(string(out)))
+	out, err := cmd.CombinedOutput()
+	// Always log the duration. This step cost one build 155.7 seconds while
+	// emitting nothing at all, so its only trace was a gap between two timestamps
+	// in a table nobody reads. A prune that starts taking minutes should be
+	// visible before it is load-bearing again.
+	if err != nil {
+		slog.Warn("bounded gc", "error", err, "took", time.Since(start), "out", strings.TrimSpace(string(out)))
+		return
 	}
+	slog.Info("bounded gc", "took", time.Since(start))
 }
 
 // buildService runs one service through buildx + tagging + retention. token is
@@ -439,12 +447,37 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 
 	b.finalize()
 	snap := b.snapshot()
-	if snap.State == BuildCompleted {
-		e.boundedGC(ctx)
+	finishBuild(snap.State, onChange, func() { e.boundedGC(ctx) })
+}
+
+// finishBuild emits the terminal event and THEN runs post-build housekeeping.
+//
+// The order is the whole point, so it lives in its own function with a test:
+// boundedGC used to run first, which put a `docker buildx prune` on the critical
+// path between "the image is built, tagged and pushed" and "anyone is told".
+//
+// Measured on the frigate 0.19 build (job 0d886787, 2026-08-29): the service's own
+// done event was emitted at 09:30:01.809 with the image already in the registry;
+// the completed event did not leave the agent until 09:32:37.557. 155.7 seconds of
+// dead air, during which control-center could not know the image was deployable.
+// The event transport itself took 56ms and the controller's watcher tick 6.4s — so
+// 96% of that build's 2m43s build-to-deploy handoff was this prune.
+//
+// It scales with how much cache the build churned, so it punishes exactly the big
+// builds where a fast handoff matters most: 0.6-2.5s for a ~200-line control-center
+// service, 155.7s for frigate.
+//
+// gc still runs synchronously afterwards — each build runs in its own goroutine
+// (jobs.go) with no global build lock, so nothing waits on it, and the job context
+// is not cancelled until run returns.
+func finishBuild(state BuildState, onChange func(JobEvent), gc func()) {
+	switch state {
+	case BuildCompleted:
 		onChange(EventCompleted)
-	} else if snap.State == BuildCancelled {
+		gc()
+	case BuildCancelled:
 		onChange(EventCancelled)
-	} else {
+	default:
 		onChange(EventFailed)
 	}
 }
