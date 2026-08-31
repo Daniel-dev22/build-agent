@@ -64,7 +64,11 @@ func (r *buildRegistry) start(parentCtx context.Context, req BuildRequest) *Buil
 	// git clone requires an empty destination, which src is.
 	root := filepath.Join(r.cfg.WorkDir, id)
 	dir := filepath.Join(root, "src")
-	_ = os.MkdirAll(dir, 0o700)
+	// The job root holds the vended GitHub token, so it stays owner-only. The
+	// context directory below it is what buildkit ships, so it gets the same
+	// world-traversable mode normalizeContextModes enforces on the tree beneath.
+	_ = os.MkdirAll(root, 0o700)
+	_ = os.MkdirAll(dir, 0o755)
 
 	jobCtx, cancel := context.WithCancel(parentCtx)
 	b := &Build{

@@ -389,6 +389,16 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 		return
 	}
 
+	// Normalise context permissions before anything ships the context to buildkit.
+	// This runs AFTER pre-build, not before: pre-build writes generated files into
+	// the context (a `make version` stamp, a web/.env), and those are created on
+	// the same storage — so a normalisation that ran only after the clone would
+	// miss them. See context_modes.go for why the on-disk modes matter at all.
+	if err := normalizeContextModes(dir); err != nil {
+		fail("normalize context modes: " + err.Error())
+		return
+	}
+
 	// Best-effort registry buildcache validation/bust before building.
 	for _, svc := range services {
 		image := d.ImagePrefix + svc.Name
