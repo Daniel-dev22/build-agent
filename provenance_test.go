@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestProvenanceForGitPath(t *testing.T) {
@@ -18,7 +20,9 @@ func TestProvenanceForGitPath(t *testing.T) {
 	if p.Context != contextGit {
 		t.Errorf("clone path => context %q; got %q", contextGit, p.Context)
 	}
-	if p.Repo != "https://github.com/blakeblackshear/frigate.git" || p.Ref != "0.19" {
+	// Normalized, not verbatim: the .git suffix is dropped so the label parses as
+	// an owner/repo slug downstream. See TestNormalizeRepoURL.
+	if p.Repo != "https://github.com/blakeblackshear/frigate" || p.Ref != "0.19" {
 		t.Errorf("repo/ref carried through; got %+v", p)
 	}
 	if p.Revision != "" {
@@ -65,6 +69,60 @@ func TestLabelArgsOmitsUnknownFieldsEntirely(t *testing.T) {
 	}
 }
 
+// Every labelArgs fixture used pre-clean values, so the sanitiser could be
+// bypassed entirely in the shipped path with the suite green.
+func TestLabelArgsSanitizesThroughTheShippedPath(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		p    provenance
+	}{
+		{"newline in ref", provenance{Context: contextGit, Ref: "0.19\nLABEL evil=1"}},
+		{"over-length ref", provenance{Context: contextGit, Ref: strings.Repeat("a", maxLabelValue+1)}},
+		{"C1 control in ref", provenance{Context: contextGit, Ref: "0.19\u0085x"}},
+		{"bidi override in ref", provenance{Context: contextGit, Ref: "0.19\u202ex"}},
+		{"line separator in repo", provenance{Context: contextGit, Repo: "https://example.invalid/\u2028x"}},
+	} {
+		got := strings.Join(c.p.labelArgs(), " ")
+		if strings.Contains(got, labelRef) && c.p.Ref != "" {
+			t.Errorf("%s: a value the sanitiser rejects still reached the argv: %q", c.name, got)
+		}
+		if strings.Contains(got, labelSource) && c.p.Repo != "" {
+			t.Errorf("%s: rejected repo still reached the argv: %q", c.name, got)
+		}
+		// The always-set context label must survive regardless.
+		if !strings.Contains(got, labelContext+"=git") {
+			t.Errorf("%s: context label must still be emitted, got %q", c.name, got)
+		}
+	}
+}
+
+// The cap is a policy number. Binding it to itself (the fixtures build their
+// inputs from the constant) meant widening it widened the test with it.
+func TestLabelValueCapIsAPolicyNumber(t *testing.T) {
+	if maxLabelValue != 512 {
+		t.Fatalf("label cap is %d; changing it is fine, but do it deliberately", maxLabelValue)
+	}
+	if got := sanitizeLabelValue(strings.Repeat("a", 513)); got != "" {
+		t.Errorf("513 bytes must be dropped, got %d bytes", len(got))
+	}
+	if got := sanitizeLabelValue(strings.Repeat("a", 512)); len(got) != 512 {
+		t.Errorf("512 bytes must pass, got %d", len(got))
+	}
+}
+
+func TestAllowedLabelRuneRejectsSpoofingAndSeparators(t *testing.T) {
+	for _, r := range []rune{0x00, 0x1f, 0x7f, 0x85, 0x9f, 0x2028, 0x2029, 0x202e, 0x2066, 0xfeff} {
+		if allowedLabelRune(r) {
+			t.Errorf("U+%04X must be rejected", r)
+		}
+	}
+	for _, r := range []rune{'a', '0', '/', '.', '-', '_', 'ü', '中'} {
+		if !allowedLabelRune(r) {
+			t.Errorf("%q must be allowed", r)
+		}
+	}
+}
+
 func TestLabelArgsOrderIsDeterministic(t *testing.T) {
 	p := provenance{Context: contextGit, Repo: "r", Ref: "f", Revision: "abc"}
 	want := []string{
@@ -100,27 +158,85 @@ func TestSanitizeLabelValue(t *testing.T) {
 	}
 }
 
-func TestScrubURLCredentials(t *testing.T) {
+func TestNormalizeRepoURL(t *testing.T) {
+	const secret = "ghs_SECRETTOKEN"
 	cases := []struct{ in, want, why string }{
-		{
-			"https://x-access-token:ghs_SECRETTOKEN@github.com/Daniel-dev22/agent-kit-go.git",
-			"https://github.com/Daniel-dev22/agent-kit-go.git",
-			"a vended token must never reach an image label",
-		},
-		{"https://user@github.com/o/r.git", "https://github.com/o/r.git", "bare userinfo also stripped"},
-		{"https://github.com/o/r.git", "https://github.com/o/r.git", "no userinfo, unchanged"},
-		{"git@github.com:o/r.git", "git@github.com:o/r.git", "scp syntax keeps its ssh user"},
-		{"  https://github.com/o/r.git  ", "https://github.com/o/r.git", "trimmed"},
-		{"https://exa mple.com/\x7f", "", "unparseable with a scheme is omitted, not guessed"},
+		{"https://x-access-token:" + secret + "@github.com/o/r.git", "https://github.com/o/r", "vended token stripped"},
+		{"git::https://x-access-token:" + secret + "@github.com/o/r.git", "", "transport helper is not reducible; dropped"},
+		{"ext::https://x-access-token:" + secret + "@github.com/o/r.git", "", "remote helper dropped"},
+		{"https://github.com/o/r.git?access_token=" + secret, "https://github.com/o/r", "credential in the query"},
+		{"https://github.com/o/r.git#" + secret, "https://github.com/o/r", "credential in the fragment"},
+		{"git@github.com:o/r.git", "https://github.com/o/r", "scp form becomes an https URL"},
+		{"git@github.com:Daniel-dev22/build-agent.git", "https://github.com/Daniel-dev22/build-agent", "the estate's actual configured form"},
+		{"https://github.com/o/r", "https://github.com/o/r", "already conformant"},
+		{"  https://github.com/o/r.git  ", "https://github.com/o/r", "trimmed"},
+		{"", "", "empty"},
+		{"not a url", "", "unrecognised shape is dropped, not guessed"},
+		{"https://exa mple.com/\x7f", "", "unparseable"},
+		{"https://github.com/o/r::x", "", "a path bearing :: is not reducible; the guard is load-bearing here"},
 	}
 	for _, c := range cases {
-		if got := scrubURLCredentials(c.in); got != c.want {
-			t.Errorf("%s: scrub(%q) = %q, want %q", c.why, c.in, got, c.want)
+		got := normalizeRepoURL(c.in)
+		if got != c.want {
+			t.Errorf("%s: normalizeRepoURL(%q) = %q, want %q", c.why, c.in, got, c.want)
+		}
+		if strings.Contains(got, secret) {
+			t.Fatalf("%s: credential survived: %q", c.why, got)
 		}
 	}
-	// The property, stated directly: no output may contain a secret from the input.
-	if got := scrubURLCredentials("https://x-access-token:ghs_SECRETTOKEN@github.com/o/r.git"); strings.Contains(got, "ghs_SECRETTOKEN") {
-		t.Fatalf("token survived scrubbing: %q", got)
+}
+
+// The value has a CONSUMER: docker-agent's sourceRepoFromLabels parses "owner/repo"
+// out of this label to pick an update strategy. Emitting the estate's configured
+// scp form fed it a slug that cannot exist. This asserts the shape that parser
+// needs, so the coupling is pinned on the writing side too.
+func TestNormalizedRepoURLIsParseableAsAnOwnerRepoSlug(t *testing.T) {
+	for _, in := range []string{
+		"git@github.com:Daniel-dev22/build-agent.git",
+		"https://github.com/blakeblackshear/frigate.git",
+	} {
+		got := normalizeRepoURL(in)
+		slug := strings.TrimPrefix(got, "https://github.com/")
+		if strings.Count(slug, "/") != 1 || strings.HasSuffix(slug, ".git") || strings.ContainsAny(slug, "@:") {
+			t.Errorf("%q -> %q: slug %q is not a clean owner/repo", in, got, slug)
+		}
+	}
+}
+
+// The scrub is pinned at the CALL SITE, not only in the helper: review showed a
+// mutation removing the call from provenanceFor survived, and that is the one
+// whose cost is unretractable once an image is pushed.
+func TestProvenanceForNormalizesTheRepoItStamps(t *testing.T) {
+	const secret = "ghs_SECRETTOKEN"
+	p := provenanceFor(BuildRequest{Repo: "https://x-access-token:" + secret + "@github.com/o/r.git", Ref: "main"})
+	if strings.Contains(p.Repo, secret) {
+		t.Fatalf("provenanceFor stamped a credential: %q", p.Repo)
+	}
+	if p.Repo != "https://github.com/o/r" {
+		t.Errorf("provenanceFor must normalize, got %q", p.Repo)
+	}
+	if got := strings.Join(p.labelArgs(), " "); strings.Contains(got, secret) {
+		t.Fatalf("credential reached the argv: %q", got)
+	}
+	// scp form is what ansible actually configures for every first-party repo.
+	if got := provenanceFor(BuildRequest{Repo: "git@github.com:Daniel-dev22/build-agent.git"}).Repo; got != "https://github.com/Daniel-dev22/build-agent" {
+		t.Errorf("scp repo not normalized, got %q", got)
+	}
+}
+
+// "context is ALWAYS set" had an untested third shape: a git request with no repo.
+func TestProvenanceForAlwaysSetsAContext(t *testing.T) {
+	for _, req := range []BuildRequest{
+		{},
+		{Repo: "https://github.com/o/r"},
+		{Repo: "https://github.com/o/r", Ref: "0.19"},
+	} {
+		if got := provenanceFor(req).Context; got != contextGit {
+			t.Errorf("non-upload request must be context=git, got %q for %+v", got, req)
+		}
+	}
+	if got := provenanceFor(BuildRequest{ContextB64: "x"}).Context; got != contextUpload {
+		t.Errorf("upload request must be context=upload, got %q", got)
 	}
 }
 
@@ -144,10 +260,19 @@ func TestBuildxArgsCarriesLabelsBeforeTheTail(t *testing.T) {
 	if li, pi := strings.LastIndex(joined, "--label"), strings.Index(joined, "--push"); li < 0 || pi < 0 || li > pi {
 		t.Errorf("labels must precede the -t/-f/--push tail; got %q", joined)
 	}
-	// A build with no provenance must produce the byte-identical argv it did
-	// before this change — the phase is additive or it is a regression.
-	if strings.Contains(strings.Join(buildxArgs("b", d, svc, "reg/app", "Dockerfile", "v", "a", "", provenance{}), " "), "--label") {
-		t.Error("zero provenance must add no flags at all")
+	// A build with no provenance must produce the argv it did before this change.
+	// Compared against a golden slice, not "does not contain --label": the latter
+	// passes for any OTHER flag this function might grow by accident.
+	want := []string{
+		"buildx", "build", "--builder", "b", "--progress=plain",
+		"--platform", "linux/amd64",
+		"--cache-from", "type=registry,ref=reg/app:buildcache",
+		"--cache-to", "type=registry,ref=reg/app:buildcache,mode=max",
+		"-t", "reg/app:latest", "-f", "Dockerfile", "--push", ".",
+	}
+	got := buildxArgs("b", d, svc, "reg/app", "Dockerfile", "v", "a", "", provenance{})
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("zero provenance must reproduce the pre-phase argv exactly\n want %v\n  got %v", want, got)
 	}
 }
 
@@ -348,6 +473,181 @@ func TestRunWiresProvenanceIntoBuildService(t *testing.T) {
 	}
 	if !passesProvIdent {
 		t.Error("run must pass the derived `prov` to buildService, not a fresh literal")
+	}
+
+	// Review defeated the four assertions above with a single added line
+	// `prov = provenance{}` between the clone and the build loop: every rule still
+	// held and every image shipped label-free. Shape is not dataflow — so pin that
+	// `prov` is assigned WHOLESALE exactly once (its `:=`), and that only its
+	// .Revision field is written afterwards.
+	wholesale, fieldWrites := 0, 0
+	revisionFromGit := false
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for _, lhs := range as.Lhs {
+			switch v := lhs.(type) {
+			case *ast.Ident:
+				if v.Name == "prov" {
+					wholesale++
+				}
+			case *ast.SelectorExpr:
+				if id, ok := v.X.(*ast.Ident); ok && id.Name == "prov" {
+					fieldWrites++
+					// The RHS matters as much as the LHS: `prov.Revision = ""`
+					// satisfies a check that only inspects what is written to.
+					if len(as.Rhs) == 1 {
+						if call, ok := as.Rhs[0].(*ast.CallExpr); ok {
+							if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "gitRevision" {
+								revisionFromGit = true
+							}
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+	if !revisionFromGit {
+		t.Error("prov.Revision must be assigned from e.gitRevision(...), not a literal")
+	}
+	if wholesale != 1 {
+		t.Errorf("prov must be assigned wholesale exactly once (its :=), found %d — a later reassignment silently empties every label", wholesale)
+	}
+	if fieldWrites != 1 {
+		t.Errorf("exactly one field write to prov expected (.Revision), found %d", fieldWrites)
+	}
+}
+
+// The hop no AST rule scoped to run() can see, and the one review showed nothing
+// pinned: buildService handing buildxArgs the provenance it was given. Driven
+// through the real buildService via the execBuildx seam, so the assertion is on
+// the argv that would actually reach docker.
+func TestBuildServicePassesItsProvenanceIntoTheArgv(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var captured []string
+	e := &engine{
+		cfg: Config{Builder: "b"},
+		reg: newRegistryClient(),
+		execBuildx: func(_ context.Context, _ *Build, _ ServiceSpec, args []string, _ string, _ func(string)) error {
+			captured = append([]string(nil), args...)
+			return errStopAfterCapture
+		},
+	}
+	b := &Build{dir: dir}
+	prov := provenance{Context: contextGit, Repo: "https://github.com/o/r", Ref: "0.19", Revision: "deadbeef"}
+	// tagVersioned/pruneOldTags would need docker; the seam returns early so the
+	// argv is what we assert on.
+	_, err := e.buildService(context.Background(), b, Descriptor{}, ServiceSpec{Name: "app", Dockerfile: "Dockerfile"},
+		"reg", "v", "a", "", prov, false, 3, nil)
+	if err == nil {
+		t.Fatal("expected the seam's sentinel error")
+	}
+	joined := strings.Join(captured, " ")
+	for _, want := range []string{
+		labelSource + "=https://github.com/o/r",
+		labelRevision + "=deadbeef",
+		labelRef + "=0.19",
+		labelContext + "=git",
+	} {
+		if !strings.Contains(joined, "--label "+want) {
+			t.Errorf("buildService dropped provenance on the way to buildxArgs: missing %q in %q", want, joined)
+		}
+	}
+}
+
+var errStopAfterCapture = errors.New("stop after capturing argv")
+
+// gitRevision must not be bounded by the CLONE timeout (5 min by default): it
+// reads one file in a clone that already exists, and a wedged git would otherwise
+// stall a build for five minutes for a label this code calls best-effort. Neither
+// property is observable from a passing call, so both are pinned at the source,
+// scoped to this one function's body.
+func TestGitRevisionUsesAShortTimeoutAndSuppressesPrompts(t *testing.T) {
+	if gitRevParseTimeout != 15*time.Second {
+		t.Errorf("rev-parse timeout is %v; change it deliberately", gitRevParseTimeout)
+	}
+	if gitRevParseTimeout >= 5*time.Minute {
+		t.Error("rev-parse must not inherit the clone-scale timeout")
+	}
+	body := funcBodySource(t, "provenance.go", "gitRevision")
+	for _, want := range []string{"gitRevParseTimeout", "GIT_TERMINAL_PROMPT=0", "clipStderr("} {
+		if !strings.Contains(body, want) {
+			t.Errorf("gitRevision must use %s", want)
+		}
+	}
+	if strings.Contains(body, "e.cfg.GitTimeout") {
+		t.Error("gitRevision must not use the clone timeout")
+	}
+}
+
+// funcBodySource returns the source text of exactly one function's body, so a
+// match in a comment elsewhere, or in another function, cannot satisfy a caller.
+func funcBodySource(t *testing.T, file, name string) string {
+	t.Helper()
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != name || fd.Body == nil {
+			continue
+		}
+		return string(src[fset.Position(fd.Body.Pos()).Offset:fset.Position(fd.Body.End()).Offset])
+	}
+	t.Fatalf("%s not found in %s — this guard is scoped to it and cannot run", name, file)
+	return ""
+}
+
+func TestCloneArgsSeparatesOptionsFromPositionals(t *testing.T) {
+	withRef := cloneArgs("https://github.com/o/r", "0.19", "/tmp/x")
+	want := []string{"clone", "--depth", "1", "--branch", "0.19", "--", "https://github.com/o/r", "/tmp/x"}
+	if strings.Join(withRef, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("clone argv\n want %v\n  got %v", want, withRef)
+	}
+	noRef := cloneArgs("https://github.com/o/r", "", "/tmp/x")
+	if strings.Join(noRef, "\x00") != strings.Join([]string{"clone", "--depth", "1", "--", "https://github.com/o/r", "/tmp/x"}, "\x00") {
+		t.Errorf("no ref => no --branch, still separated; got %v", noRef)
+	}
+	// The property, stated directly: every positional follows a bare "--".
+	for _, a := range []string{"-oProxyCommand=x", "ext::sh -c id"} {
+		got := cloneArgs(a, "", "/tmp/x")
+		sep := -1
+		for i, v := range got {
+			if v == "--" {
+				sep = i
+				break
+			}
+		}
+		if sep < 0 || got[sep+1] != a {
+			t.Errorf("a %q repo must sit after the separator; got %v", a, got)
+		}
+	}
+}
+
+func TestClipStderrCutsOnARuneBoundary(t *testing.T) {
+	// 3-byte runes: the cap lands mid-rune, so a byte slice would emit invalid UTF-8.
+	in := strings.Repeat("中", maxLoggedStderr)
+	got := clipStderr(in)
+	if !utf8.ValidString(got) {
+		t.Errorf("clipped message is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("over-cap message must be marked, got %q", got)
+	}
+	if n := len(strings.TrimSuffix(got, "…")); n > maxLoggedStderr {
+		t.Errorf("clipped to %d bytes, cap is %d", n, maxLoggedStderr)
 	}
 }
 

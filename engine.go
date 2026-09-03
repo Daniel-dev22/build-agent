@@ -62,6 +62,13 @@ type engine struct {
 	cfg Config
 	cc  *http.Client
 	reg *registryClient
+
+	// execBuildx runs the assembled buildx argv. A seam, not a strategy: the only
+	// caller that overrides it is a test. Review showed that nothing pinned
+	// buildService handing buildxArgs the provenance it was given — an AST rule
+	// scoped to run() cannot see this hop, so one wrong argument here ships every
+	// image label-free with the whole suite green. nil means the real docker exec.
+	execBuildx func(ctx context.Context, b *Build, svc ServiceSpec, args []string, dir string, onLine func(string)) error
 }
 
 func newEngine(cfg Config, cc *http.Client) *engine {
@@ -124,14 +131,23 @@ func (e *engine) gitClone(ctx context.Context, b *Build, repo, ref, dir, token s
 	}
 	cctx, cancel := context.WithTimeout(ctx, e.cfg.GitTimeout)
 	defer cancel()
+	cmd := exec.CommandContext(cctx, "git", cloneArgs(url, ref, dir)...)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	return e.stream(b, "git", cmd, nil)
+}
+
+// cloneArgs builds the `git clone` argv. Pure so the end-of-options separator is
+// testable: "--" means a repo URL or directory beginning with "-" can never be
+// read as an option (git would otherwise treat it as one, and an "ext::" URL as a
+// remote helper to execute). Unreachable today — the repo comes from an
+// mTLS-gated caller — but the provenance work puts an externally-influenced URL
+// one field away from this argv.
+func cloneArgs(url, ref, dir string) []string {
 	args := []string{"clone", "--depth", "1"}
 	if ref != "" {
 		args = append(args, "--branch", ref)
 	}
-	args = append(args, url, dir)
-	cmd := exec.CommandContext(cctx, "git", args...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	return e.stream(b, "git", cmd, nil)
+	return append(args, "--", url, dir)
 }
 
 // ensureBuilder reuses the persistent buildx builder (cache mounts survive); only
@@ -206,8 +222,6 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 	}
 	args := buildxArgs(e.cfg.Builder, d, svc, full, dockerfile, versionTag, apkBust, secretFile, prov)
 
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Dir = b.workdir()
 	// Parse buildx stage-step lines off the same stream and surface them as a
 	// live indicator. Only a real step change broadcasts (setServiceStep dedupes),
 	// so the coalescing fleet hub sees at most one trigger per step.
@@ -218,7 +232,11 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 			}
 		}
 	}
-	if err := e.stream(b, svc.Name, cmd, onLine); err != nil {
+	run := e.execBuildx
+	if run == nil {
+		run = e.execBuildxDocker
+	}
+	if err := run(ctx, b, svc, args, b.workdir(), onLine); err != nil {
 		return "", err
 	}
 	if err := e.tagVersioned(ctx, full, versionTag); err != nil {
@@ -226,6 +244,13 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 	}
 	e.reg.pruneOldTags(ctx, registry, image, retentionKeep)
 	return image, nil
+}
+
+// execBuildxDocker is the production implementation of the execBuildx seam.
+func (e *engine) execBuildxDocker(ctx context.Context, b *Build, svc ServiceSpec, args []string, dir string, onLine func(string)) error {
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Dir = dir
+	return e.stream(b, svc.Name, cmd, onLine)
 }
 
 // buildxArgs assembles the `docker buildx build ...` argument vector for one
