@@ -195,15 +195,85 @@ func TestGitRevisionFailureIsEmptyAndLogged(t *testing.T) {
 		t.Skip("git is not installed; gitRevision has nothing to drive")
 	}
 	e := &engine{cfg: Config{GitTimeout: 30 * time.Second}}
-	b := &Build{}
-	if got := e.gitRevision(context.Background(), b, filepath.Join(t.TempDir(), "not-a-repo")); got != "" {
-		t.Errorf("non-repo => empty revision; got %q", got)
-	}
-	if b.LineCount == 0 {
-		t.Error("a dropped label must leave a trace in the build log")
+
+	// The two ways this actually fails produce different messages from git, and
+	// the point of capturing stderr is that the log distinguishes them. This
+	// failure is silent by design — the build still succeeds — so the log line is
+	// the entire diagnosis anyone will ever get; "exit status 128" is not one.
+	existing := t.TempDir()
+	for _, c := range []struct{ dir, want string }{
+		{filepath.Join(t.TempDir(), "absent"), "No such file or directory"},
+		{existing, "not a git repository"},
+	} {
+		b := &Build{}
+		if got := e.gitRevision(context.Background(), b, c.dir); got != "" {
+			t.Errorf("%s: non-repo => empty revision; got %q", c.want, got)
+		}
+		if b.LineCount == 0 {
+			t.Fatalf("%s: a dropped label must leave a trace in the build log", c.want)
+		}
+		line := b.ringBuffer[len(b.ringBuffer)-1]
+		if !strings.Contains(line, c.want) {
+			t.Errorf("log line must carry git's own reason (%q), got %q", c.want, line)
+		}
+		if strings.Contains(line, "exit status") && !strings.Contains(line, c.want) {
+			t.Errorf("log line degraded to the bare exit code: %q", line)
+		}
 	}
 	if got := (provenance{Context: contextGit, Repo: "r", Ref: "f"}).labelArgs(); strings.Contains(strings.Join(got, " "), labelRevision) {
 		t.Errorf("an unread revision must omit its label; got %v", got)
+	}
+}
+
+// The clip only fires on a stderr longer than the cap, which no ordinary failure
+// produces — so without this the cap could be moved, or removed, with the suite
+// green. git names the offending path in its message, so a long enough path
+// drives the real truncation through the real function rather than a helper.
+func TestClipStderrBoundary(t *testing.T) {
+	// The cap is a deliberate policy number, asserted as a literal so widening it
+	// is a decision someone makes on purpose rather than a silent drift.
+	if maxLoggedStderr != 200 {
+		t.Fatalf("log clip is %d; changing it is fine, but do it deliberately", maxLoggedStderr)
+	}
+	for _, n := range []int{0, 1, maxLoggedStderr - 1, maxLoggedStderr} {
+		in := strings.Repeat("x", n)
+		if got := clipStderr(in); got != in {
+			t.Errorf("%d bytes is at or under the cap and must pass through whole; got %d bytes", n, len(got))
+		}
+	}
+	// One byte over is the only input that distinguishes > from >=.
+	over := strings.Repeat("x", maxLoggedStderr+1)
+	got := clipStderr(over)
+	if got != strings.Repeat("x", maxLoggedStderr)+"…" {
+		t.Errorf("one byte over must clip to exactly the cap plus a marker; got %d bytes, suffix %q", len(got), got[len(got)-4:])
+	}
+	if clipStderr("  padded  ") != "padded" {
+		t.Error("clipStderr trims, so an all-whitespace stderr falls back to the exit error")
+	}
+}
+
+func TestGitRevisionClipsARunawayStderr(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed; gitRevision has nothing to drive")
+	}
+	// Never created: git fails to chdir and echoes the whole path back.
+	long := filepath.Join(t.TempDir(), strings.Repeat("a", 200), strings.Repeat("b", 200))
+	e := &engine{cfg: Config{GitTimeout: 30 * time.Second}}
+	b := &Build{}
+	if got := e.gitRevision(context.Background(), b, long); got != "" {
+		t.Errorf("non-repo => empty revision; got %q", got)
+	}
+	if b.LineCount == 0 {
+		t.Fatal("expected a log line")
+	}
+	line := b.ringBuffer[len(b.ringBuffer)-1]
+	if !strings.HasSuffix(line, "…") {
+		t.Errorf("an over-cap stderr must be clipped and marked; got %q", line)
+	}
+	// The cap bounds the git message, not the whole line — the prefix is ours.
+	const prefix = "[git] rev-parse HEAD failed, omitting the revision label: "
+	if got := len([]byte(strings.TrimSuffix(strings.TrimPrefix(line, prefix), "…"))); got != maxLoggedStderr {
+		t.Errorf("clipped message = %d bytes, want exactly %d", got, maxLoggedStderr)
 	}
 }
 

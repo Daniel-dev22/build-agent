@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"net/url"
 	"os"
@@ -36,6 +37,10 @@ const (
 	// than truncated: half a URL is worse than no URL, because it still reads as
 	// an answer.
 	maxLabelValue = 512
+
+	// Enough of git's own message to name the cause; a runaway stderr must not
+	// flood the build's ring buffer and evict the build output around it.
+	maxLoggedStderr = 200
 )
 
 // provenance is what one build knows about its own source. Zero values mean
@@ -146,10 +151,34 @@ func (e *engine) gitRevision(ctx context.Context, b *Build, dir string) string {
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "git", "-C", dir, "rev-parse", "HEAD")
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	// stderr is captured explicitly rather than left to cmd.Output(): "exit status
+	// 128" alone cannot be acted on, and this failure is silent by design (the
+	// build still succeeds), so the log line is the ONLY evidence it happened.
+	// Safe to log — this invocation is given no URL, so unlike the clone there is
+	// no credential in anything git can print here.
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		b.appendLine("[git] rev-parse HEAD failed, omitting the revision label: " + err.Error())
+		msg := clipStderr(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		b.appendLine("[git] rev-parse HEAD failed, omitting the revision label: " + msg)
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// clipStderr bounds one captured stderr to what a build log should carry. Split
+// out because the boundary is only reachable with an exact-length input, and a
+// git message long enough to reach it cannot be produced on demand — so through
+// gitRevision alone the cap could be widened, or its comparison flipped, with the
+// suite green. Both were verified to survive before this existed.
+func clipStderr(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > maxLoggedStderr {
+		return s[:maxLoggedStderr] + "…"
+	}
+	return s
 }
