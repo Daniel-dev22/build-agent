@@ -8,7 +8,7 @@ document; this is the first phase that ships code.
 | | |
 |---|---|
 | Built | yes — `provenance.go` (new), `engine.go` (wiring), `provenance_test.go` (new) |
-| Reviewed | **self-review only.** Four independent lenses were NOT run — see *What was not done* |
+| Reviewed | **four independent lenses + skeptical verification, then every finding fixed.** See *The review* |
 | Merged | see the branch `feat/image-provenance`; check `git log main` for whether it landed |
 | Tagged | **no** |
 | Deployed | **no.** A deploy/release/tag hold was in force; nothing has run on kd-nas01 |
@@ -65,12 +65,18 @@ There is a test pinning that discard.
   this reason (`declared and not used`) and was re-run in a compilable form.
 - `go test -race ./...` clean. `prov` is a value struct fully populated before any
   service goroutine starts, so the per-service closures read a frozen copy.
-- **The wiring is pinned by reading `run`'s own AST**, not by grepping the file: it
-  asserts `provenanceFor` is called, `prov.Revision` is assigned, there is **exactly
-  one** `buildService` call site, and that site is passed the identifier `prov`. A
-  string in a comment cannot satisfy any of it. `engine.run` needs docker, git, a
-  builder and a registry, so this is the honest floor — without it the whole phase
-  ships inert with every unit test green.
+- **The wiring is pinned by reading `run`'s own AST** — plus, after review, by an
+  `execBuildx` seam that drives the real `buildService` and asserts the argv.
+
+  🔴 **The original version of this bullet was false and is worth reading as a
+  warning.** It claimed the AST test meant the phase "could not ship inert with
+  every unit test green". Review defeated all four of its assertions with a single
+  added line — `prov = provenance{}` between the clone and the build loop — and
+  showed the guard was scoped to `run`, so *nothing at all* pinned `buildService`
+  handing `buildxArgs` the provenance it was given. **Shape is not dataflow.** The
+  guard now also requires that `prov` is assigned wholesale exactly once and that
+  `.Revision` comes from `gitRevision` rather than any literal, and the seam covers
+  the hop no AST rule scoped to `run` can see.
 - `gitRevision` is driven against a **real git repository** created in `t.TempDir()`
   (hermetic identity via `GIT_AUTHOR_*` env, RFC 2606 address — deliberately not
   `git -c user.email`, which is forbidden in this estate and would also make the
@@ -88,7 +94,16 @@ There is a test pinning that discard.
 - That labels land on **each child image of a multi-arch manifest**, not only the
   manifest list. Phase 2 reads labels off the running container's resolved image, so
   a manifest-only label would make phase 2 silently empty on any `platform: auto`
-  project. Frigate is `fixed linux/amd64` and will not exercise this.
+  project.
+
+  🔴 **This handoff originally said "Frigate is fixed amd64 and will not exercise
+  this". That was wrong.** Every descriptor in the estate is `{"mode": "auto"}` —
+  all nine checked — so `platformArgs` emits `--platform linux/amd64,linux/arm64`
+  and **the very first build with this code (build-agent rebuilding itself) is a
+  two-platform build.** The case dismissed as unexercised is the first one that
+  runs, and it is the one that would make phase 2 silently empty everywhere. The
+  rollout check must inspect a **pulled per-platform child**, on an amd64 and an
+  arm64 host — not the manifest, and not the build host only.
 
 ## Decisions, and what was rejected
 
@@ -110,6 +125,44 @@ There is a test pinning that discard.
   `refs/heads/*` or `packed-refs` is more code and more failure modes for an
   immeasurable saving. This is the `syscalls-over-subprocesses` carve-out: the cost
   is not per-cycle, and git is already the tool in this path.
+
+## The review
+
+Four independent lenses (domain correctness, security/release surface, regression,
+verification quality) ran against the frozen merged SHA, then every finding was
+verified by hand before being fixed.
+
+📏 **The verification lens ran 41 mutations and found 22 genuine survivors, against
+my own campaign's 20/20 and 19/19.** The gap is structural, not carelessness: an
+author mutates the lines he wrote; a lens mutates the properties he *claimed*. Two
+lenses independently found the label-key coupling below — the strongest signal a
+review produces.
+
+What the lenses found that the author's campaign could not:
+
+- **The label has a consumer nobody looked for.** `org.opencontainers.image.source`
+  is already read by docker-agent's `sourceRepoFromLabels` to choose an update
+  strategy, and this phase began writing a value it cannot parse (every repo here is
+  configured in scp syntax, which that parser accepts verbatim as a slug). The
+  estate's "changing a shared object means finding its other callers" rule had been
+  applied to functions and structs and **not to a label key**, which is exactly what
+  a shared object is here. `scrubURLCredentials` became `normalizeRepoURL`, emitting
+  the OCI https form.
+- **The credential scrub leaked in four measured forms** — a transport-helper prefix
+  (`git::`, `ext::`) makes `url.Parse` return an Opaque URL so clearing `User` is a
+  no-op, and a credential in the `?query` or `#fragment` is not userinfo at all.
+  Reproduced against the shipped function: 4 of 6 forms leaked.
+- **`sanitizeLabelValue` and `scrubURLCredentials` were pinned only as helpers.**
+  Every fixture through the shipped path used pre-clean values, so both could be
+  bypassed in `labelArgs`/`provenanceFor` with the suite green — the same seam the
+  security lens reached from the other direction.
+- The 512 cap **bound a copy of itself**; "context is ALWAYS set" was untested for a
+  git request with no repo; the rev-parse reused the five-minute **clone** timeout.
+
+**Fixing the findings produced three more survivors**, all found by re-canarying the
+fixes rather than only the original code: an equivalent `::` guard, an untested
+clone separator, and an AST rule that checked an assignment's left side but not its
+right. Final canary: **23 mutations, 23 caught.**
 
 ## Deferred
 
@@ -147,15 +200,10 @@ the form field is a string enum and `handlePopulateFields` assigns without coerc
   second build of the same source to confirm the cache still hits. "No errors in the
   build log" is not evidence for either.
 
-## What was not done
+## The lesson worth carrying
 
-**The four independent review lenses were not run.** This session is configured not
-to spawn subagents, so the merge gate was a self-review plus the mutation campaign
-above. That is a materially weaker instrument and the gap is measured: on comparable
-phases a self-review found 4–5 findings where four lenses found 28–50, and an
-author's own mutation campaign scored 20/20 while an independent lens found 36
-survivors on the same diff — because the author mutates the lines he wrote and the
-lens mutates the properties he claimed.
-
-So read the 20/20 above as *"the author's list is covered"*, not as *"this diff is
-clean"*. If lenses can be run before this reaches a host, run them.
+Read a self-run mutation score as *"the author's list is covered"*, never as *"this
+diff is clean"*. This phase is now a measured instance of that: 20/20 from the
+author, 22 genuine survivors from an independent lens on the same code, and the two
+highest-severity findings came from neither campaign — they came from reading who
+else consumed the thing being written.

@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 // Image provenance: the labels every build stamps so a running container can
@@ -41,6 +43,11 @@ const (
 	// Enough of git's own message to name the cause; a runaway stderr must not
 	// flood the build's ring buffer and evict the build output around it.
 	maxLoggedStderr = 200
+
+	// rev-parse reads one file in a clone that already exists; it is not a clone.
+	// Reusing GitTimeout (5 min) would let a wedged git stall the build for five
+	// minutes for a label this file calls best-effort.
+	gitRevParseTimeout = 15 * time.Second
 )
 
 // provenance is what one build knows about its own source. Zero values mean
@@ -63,7 +70,7 @@ func provenanceFor(req BuildRequest) provenance {
 	}
 	return provenance{
 		Context: contextGit,
-		Repo:    scrubURLCredentials(req.Repo),
+		Repo:    normalizeRepoURL(req.Repo),
 		Ref:     req.Ref,
 	}
 }
@@ -101,38 +108,94 @@ func sanitizeLabelValue(s string) string {
 		return ""
 	}
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if !allowedLabelRune(r) {
 			return ""
 		}
 	}
 	return s
 }
 
-// scrubURLCredentials removes any userinfo from a URL-form repo so a credential
-// can never be baked into a published image label.
-//
-// req.Repo is the caller's URL and the token-bearing form is built locally inside
-// gitClone, so today nothing reaches here with a secret in it. This is defence in
-// depth against that ordering ever changing: the cost of being wrong is a token
-// published in an image that is then pushed to a registry, which cannot be
-// retracted by deleting the tag.
-//
-// scp-like syntax (git@github.com:owner/repo.git) is left alone — its "git@" is
-// the ssh user, carries no secret, and removing it would break the URL as a clone
-// target for anything that later reads the label.
-func scrubURLCredentials(repo string) string {
-	repo = strings.TrimSpace(repo)
-	if !strings.Contains(repo, "://") {
-		return repo
+// allowedLabelRune rejects every rune that can corrupt or spoof a label read back
+// as a line of text. C0 and DEL are the obvious half; review added the rest,
+// which are the ones that survive a naive filter: the C1 block, the Unicode line
+// and paragraph separators, and the bidi overrides that let a rendered ref read
+// as a different ref than the one stored.
+func allowedLabelRune(r rune) bool {
+	switch {
+	case r < 0x20, r == 0x7f:
+		return false
+	case r >= 0x80 && r <= 0x9f: // C1
+		return false
+	case r == 0x2028 || r == 0x2029: // LINE / PARAGRAPH SEPARATOR
+		return false
+	case r >= 0x202a && r <= 0x202e: // bidi embedding / override
+		return false
+	case r >= 0x2066 && r <= 0x2069: // bidi isolates
+		return false
+	case r == 0xfeff: // zero-width no-break space
+		return false
 	}
-	u, err := url.Parse(repo)
-	if err != nil {
-		// Unparseable and scheme-bearing: it may still hold a credential, and we
-		// cannot tell. Omit rather than guess.
+	return true
+}
+
+// normalizeRepoURL turns a clone URL into the value stamped as
+// org.opencontainers.image.source, or "" to omit the label.
+//
+// It does two jobs that were previously one, because review found the first was
+// incomplete and the second was missing entirely.
+//
+// 1. NO CREDENTIAL MAY REACH A PUSHED IMAGE. The predecessor only cleared
+// url.User, which leaks in four measured forms: a transport-helper prefix
+// (git::https://tok@host/…, ext::…) makes url.Parse yield an Opaque URL so
+// clearing User is a no-op, and a credential in the ?query or #fragment is not
+// userinfo at all. An image cannot be un-published by deleting its tag, so
+// anything not reducible to a recognised, credential-free shape is DROPPED.
+//
+// 2. THE VALUE MUST BE A URL, because this key already has a consumer.
+// docker-agent's sourceRepoFromLabels reads org.opencontainers.image.source to
+// decide an image's update strategy, and it parses "owner/repo" out of an https
+// GitHub URL. The estate configures every repo in scp syntax
+// (git@github.com:Daniel-dev22/build-agent.git), which that parser accepts as a
+// slug verbatim — one "/" — and would then query a repository that cannot exist,
+// flipping a working digest comparison into a hard update failure. Emitting the
+// OCI-conformant https form (the spec says "URL to get source code") makes the
+// existing parser correct rather than merely unbroken. The .git suffix is dropped
+// for the same reason: nothing downstream strips it.
+func normalizeRepoURL(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
 		return ""
 	}
-	u.User = nil
-	return u.String()
+	// A git transport helper ("git::", "ext::", …) can carry an arbitrary nested
+	// URL or an executable remote helper. Not reducible to a source URL, and the
+	// place to find out is not here.
+	if strings.Contains(repo, "::") {
+		return ""
+	}
+	if strings.Contains(repo, "://") {
+		u, err := url.Parse(repo)
+		if err != nil || u.Host == "" {
+			return ""
+		}
+		// Userinfo, query and fragment are all credential-bearing in the wild and
+		// none of them belong in a source URL.
+		u.User, u.RawQuery, u.Fragment = nil, "", ""
+		u.Path = strings.TrimSuffix(u.Path, ".git")
+		return u.String()
+	}
+	// scp-like syntax: [user@]host:path. The user is an ssh login, never a secret,
+	// and is dropped because it is not part of the source's identity.
+	at := strings.LastIndex(repo, "@")
+	colon := strings.Index(repo[at+1:], ":")
+	if colon < 0 {
+		return ""
+	}
+	host := repo[at+1 : at+1+colon]
+	path := strings.TrimPrefix(repo[at+1+colon+1:], "/")
+	if host == "" || path == "" || strings.Contains(host, "/") {
+		return ""
+	}
+	return "https://" + host + "/" + strings.TrimSuffix(path, ".git")
 }
 
 // gitRevision resolves the commit the clone actually landed on.
@@ -147,7 +210,7 @@ func scrubURLCredentials(repo string) string {
 // alternative (parsing .git/HEAD, then refs/heads or packed-refs) is more code and
 // more failure modes to save an immeasurable amount of wall clock.
 func (e *engine) gitRevision(ctx context.Context, b *Build, dir string) string {
-	cctx, cancel := context.WithTimeout(ctx, e.cfg.GitTimeout)
+	cctx, cancel := context.WithTimeout(ctx, gitRevParseTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "git", "-C", dir, "rev-parse", "HEAD")
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
@@ -177,8 +240,15 @@ func (e *engine) gitRevision(ctx context.Context, b *Build, dir string) string {
 // suite green. Both were verified to survive before this existed.
 func clipStderr(s string) string {
 	s = strings.TrimSpace(s)
-	if len(s) > maxLoggedStderr {
-		return s[:maxLoggedStderr] + "…"
+	if len(s) <= maxLoggedStderr {
+		return s
 	}
-	return s
+	// Cut on a rune boundary. A byte slice can split a multi-byte git message
+	// mid-rune and put invalid UTF-8 into the ring buffer that the job-log API
+	// serves; json.Marshal then silently substitutes U+FFFD.
+	cut := maxLoggedStderr
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
