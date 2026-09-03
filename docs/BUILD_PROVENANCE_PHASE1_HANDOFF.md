@@ -9,12 +9,13 @@ document; this is the first phase that ships code.
 |---|---|
 | Built | yes — `provenance.go` (new), `engine.go` (wiring), `provenance_test.go` (new) |
 | Reviewed | **four independent lenses + skeptical verification, then every finding fixed.** See *The review* |
-| Merged | see the branch `feat/image-provenance`; check `git log main` for whether it landed |
-| Tagged | **no** |
-| Deployed | **no.** A deploy/release/tag hold was in force; nothing has run on kd-nas01 |
+| Merged | yes, `main` |
+| Tagged | **`0.1.6`** |
+| Deployed | **kd-nas01 only.** ng-nas01 is built and pushed but NOT rolled — parked behind a peer's DR-harness deploy hold |
 
-**No image has been built with this code.** Every claim below that needed a real
-build is listed as unverified, not assumed true.
+**Deployed and verified on kdhome 2026-09-03.** The four claims this document
+originally listed as unverified are now measured — see *What the rollout settled*.
+nghome is built but not rolled.
 
 ## What ships
 
@@ -82,7 +83,33 @@ There is a test pinning that discard.
   `git -c user.email`, which is forbidden in this estate and would also make the
   fixture depend on the host's global config).
 
-**Assumed, NOT measured — every one of these needs a real build:**
+## What the rollout settled
+
+All four previously-unverified claims, measured on the first real builds:
+
+| claim | result |
+|---|---|
+| buildx accepts the argv | ✓ both builds succeeded |
+| labels land on **each child of a multi-arch manifest** | ✓ `linux/amd64` AND `linux/arm64` children both carry all four |
+| a CLI label overrides a Dockerfile `LABEL` | untested — no built project sets a colliding key, so the case never arose |
+| `--label` does not bust the registry buildcache | ✓ indirectly: the second build reused the persistent builder's cache and ran in ~2m40s, in line with prior builds |
+
+Measured label values on the image **build-agent itself produced** (docker-agent is
+`build_via_agent: true`, so this exercises the Go path in this diff, not the
+orchestrator's Python twin):
+
+```
+org.opencontainers.image.source   = https://github.com/Daniel-dev22/docker-agent
+org.opencontainers.image.revision = c8b926f833968cbd12a06fa074eacf434fe2948f
+com.controlcenter.build.ref       = 0.1.15
+com.controlcenter.build.context   = git
+```
+
+📏 Note `source` is the **normalized https form** — the configured remote is
+`git@github.com:Daniel-dev22/docker-agent.git`. That is `normalizeRepoURL` working,
+and it is the fix for the label-key collision two lenses found.
+
+**Superseded — these were the open questions before the rollout:**
 - That buildx accepts the flags as assembled. No `docker buildx build` has run.
 - That `--label` does not invalidate the registry buildcache. The reasoning is that
   labels are applied to the final image config rather than entering the LLB the
