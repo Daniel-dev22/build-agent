@@ -194,7 +194,7 @@ func (e *engine) boundedGC(ctx context.Context) {
 // buildService runs one service through buildx + tagging + retention. token is
 // passed as a buildx secret (id=ghtoken) so the Dockerfile can `go mod download`
 // private modules. Returns the resulting image repo path on success.
-func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc ServiceSpec, registry, versionTag, apkBust, secretFile string, tagRotation bool, retentionKeep int, notify func()) (string, error) {
+func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc ServiceSpec, registry, versionTag, apkBust, secretFile string, prov provenance, tagRotation bool, retentionKeep int, notify func()) (string, error) {
 	image := d.ImagePrefix + svc.Name
 	full := registry + "/" + image
 	dockerfile := svc.dockerfile()
@@ -204,7 +204,7 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 	if tagRotation {
 		e.rotateTags(ctx, full)
 	}
-	args := buildxArgs(e.cfg.Builder, d, svc, full, dockerfile, versionTag, apkBust, secretFile)
+	args := buildxArgs(e.cfg.Builder, d, svc, full, dockerfile, versionTag, apkBust, secretFile, prov)
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Dir = b.workdir()
@@ -230,9 +230,9 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 
 // buildxArgs assembles the `docker buildx build ...` argument vector for one
 // service. Pure (no exec) so the arg ordering — platform, cache, build-args,
-// optional --target, optional ghtoken secret, and the trailing -t/-f/--push
-// context — is unit-testable.
-func buildxArgs(builder string, d Descriptor, svc ServiceSpec, full, dockerfile, versionTag, apkBust, secretFile string) []string {
+// optional --target, optional ghtoken secret, the provenance labels, and the
+// trailing -t/-f/--push context — is unit-testable.
+func buildxArgs(builder string, d Descriptor, svc ServiceSpec, full, dockerfile, versionTag, apkBust, secretFile string, prov provenance) []string {
 	args := []string{"buildx", "build", "--builder", builder, "--progress=plain"}
 	args = append(args, platformArgs(d)...)
 	args = append(args,
@@ -245,6 +245,10 @@ func buildxArgs(builder string, d Descriptor, svc ServiceSpec, full, dockerfile,
 	if secretFile != "" {
 		args = append(args, "--secret", "id=ghtoken,src="+secretFile)
 	}
+	// Provenance labels. Applied to the final image config, so they do not enter
+	// the LLB the solver keys its cache on — a build whose only change is a label
+	// still hits the registry buildcache.
+	args = append(args, prov.labelArgs()...)
 	args = append(args, "-t", full+":latest", "-f", dockerfile, "--push", svc.buildContext())
 	return args
 }
@@ -340,6 +344,13 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 	// otherwise the agent clones repo@ref. Token vend only applies to the clone
 	// path — an uploaded context never needs git auth, so secretFile stays empty
 	// and buildService skips the buildx secret.
+	//
+	// Provenance is decided here, from the request, so both context sources are
+	// covered by one branch rather than two: whichever arm runs below, the image
+	// gets labels describing the source it actually came from. Revision is the
+	// only part that cannot be known yet — it needs the clone to exist.
+	prov := provenanceFor(req)
+
 	var secretFile string
 	if req.ContextB64 != "" {
 		if err := extractContextTarGz(req.ContextB64, dir); err != nil {
@@ -374,6 +385,7 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			fail("git clone: " + err.Error())
 			return
 		}
+		prov.Revision = e.gitRevision(ctx, b, dir)
 	}
 	if err := e.ensureBuilder(ctx, b); err != nil {
 		fail(err.Error())
@@ -434,7 +446,7 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			})
 			onChange(EventProgress)
 
-			image, err := e.buildService(ctx, b, d, svc, registry, versionTag, apkBust, secretFile, tagRotation, retentionKeep, notify)
+			image, err := e.buildService(ctx, b, d, svc, registry, versionTag, apkBust, secretFile, prov, tagRotation, retentionKeep, notify)
 			finish := func(sp *ServiceProgress) {
 				now := time.Now().UTC()
 				sp.EndedAt = &now
