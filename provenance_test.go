@@ -350,3 +350,27 @@ func TestRunWiresProvenanceIntoBuildService(t *testing.T) {
 		t.Error("run must pass the derived `prov` to buildService, not a fresh literal")
 	}
 }
+
+// The four keys are a contract with docker-agent, which reads them back off the
+// image (docker-agent/provenance.go). Pinned as literals, not derived from the
+// constants, so a typo here fails HERE rather than silently producing images whose
+// provenance no consumer recognises — a failure that looks exactly like "nothing
+// has been rebuilt yet". docker-agent has the mirror of this test.
+//
+// The keys are duplicated rather than hoisted into agent-kit-go on purpose: the kit
+// is a public module and com.controlcenter.* is this estate's namespace. See D7 in
+// control-center/docs/BUILD_PROVENANCE_PLAN.md.
+func TestLabelKeysAreTheContractDockerAgentReads(t *testing.T) {
+	for _, c := range []struct{ got, want string }{
+		{labelSource, "org.opencontainers.image.source"},
+		{labelRevision, "org.opencontainers.image.revision"},
+		{labelRef, "com.controlcenter.build.ref"},
+		{labelContext, "com.controlcenter.build.context"},
+		{contextGit, "git"},
+		{contextUpload, "upload"},
+	} {
+		if c.got != c.want {
+			t.Errorf("label contract drifted: this repo writes %q, docker-agent reads %q", c.got, c.want)
+		}
+	}
+}
