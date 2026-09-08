@@ -4,7 +4,10 @@
 # Stage 1 (builder) compiles the static, CGO-free binary, cross-compiling to
 # ${TARGETARCH} so multi-arch builds never run the Go toolchain under emulation.
 # Stage 2 is the runtime: it needs the docker CLI + buildx plugin + git, because
-# the agent shells out to them against the host's mounted docker socket.
+# the agent shells out to them against the host's mounted docker socket. It also
+# needs make, because a descriptor's `pre_build` hooks stamp generated sources by
+# invoking the upstream project's own build rules (frigate's `make version`)
+# rather than reimplementing them here.
 #
 # The builder fetches github.com/Daniel-dev22/agent-kit-go, which is still a
 # PRIVATE module — hence GOPRIVATE, the SSH url rewrite, and `--mount=type=ssh`
@@ -32,7 +35,7 @@ ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-w -s" -o /out/build-agent .
 
 FROM alpine:3.21
-RUN apk add --no-cache docker-cli docker-cli-buildx git ca-certificates
+RUN apk add --no-cache docker-cli docker-cli-buildx git make ca-certificates
 COPY --from=builder /out/build-agent /usr/local/bin/build-agent
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
