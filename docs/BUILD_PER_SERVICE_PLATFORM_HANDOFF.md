@@ -1,6 +1,6 @@
 # build-agent: per-service platform (handoff)
 
-**Status:** branch `feat/per-service-platform`; merged/tagged/deployed state is in the orchestrator ledger, not here.
+**Status:** branch `feat/per-service-platform`; merged (`a1d0418`), tagged `0.1.8`, and deployed to both sites per the user (2026-10-31; this session ran no deploy). Live check from one site's router: a trigger with `platform.value` `windows/amd64` answers 400 `descriptor.service x: platform.value ... is not a linux/<arch> list`, so the validating agent is live there. The other site was not probed.
 
 **What shipped.** `services[].platform` (`{mode, value}`, same type as the project field) overrides the project platform for one service; nil inherits. `platformArgs(d, svc)` is the only resolver and `buildxArgs` its only caller. Consumer: `price-monitor-browser` (Chrome is amd64-only) via its `build.json` is **pending**: 0 of 1,101 `build.json` files carry `services[].platform` yet.
 
