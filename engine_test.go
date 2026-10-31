@@ -36,11 +36,11 @@ func TestSelectServices(t *testing.T) {
 }
 
 func TestPlatformArgs(t *testing.T) {
-	auto := platformArgs(Descriptor{Platform: PlatformSpec{Mode: "auto"}})
+	auto := platformArgs(Descriptor{Platform: PlatformSpec{Mode: "auto"}}, ServiceSpec{})
 	if strings.Join(auto, " ") != "--platform linux/amd64,linux/arm64" {
 		t.Errorf("auto => multi-arch; got %v", auto)
 	}
-	fixed := platformArgs(Descriptor{Platform: PlatformSpec{Mode: "fixed", Value: "linux/arm64"}})
+	fixed := platformArgs(Descriptor{Platform: PlatformSpec{Mode: "fixed", Value: "linux/arm64"}}, ServiceSpec{})
 	if strings.Join(fixed, " ") != "--platform linux/arm64" {
 		t.Errorf("fixed wins; got %v", fixed)
 	}

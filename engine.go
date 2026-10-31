@@ -86,12 +86,16 @@ func nativePlatform() string {
 	}
 }
 
-// platformArgs: a fixed-platform descriptor wins; else multi-arch (auto) fans out
-// to amd64+arm64. The agent defaults auto→multi-arch because builds are pushed to
-// a registry that serves both architectures.
-func platformArgs(d Descriptor) []string {
-	if d.Platform.Mode == "fixed" && d.Platform.Value != "" {
-		return []string{"--platform", d.Platform.Value}
+// platformArgs: a service's own platform wins over the project's; a fixed platform is used
+// verbatim; else multi-arch (auto) fans out to amd64+arm64. The agent defaults auto→multi-arch
+// because builds are pushed to a registry that serves both architectures.
+func platformArgs(d Descriptor, svc ServiceSpec) []string {
+	spec := d.Platform
+	if svc.Platform != nil {
+		spec = *svc.Platform
+	}
+	if spec.Mode == "fixed" && spec.Value != "" {
+		return []string{"--platform", spec.Value}
 	}
 	return []string{"--platform", "linux/amd64,linux/arm64"}
 }
@@ -259,7 +263,7 @@ func (e *engine) execBuildxDocker(ctx context.Context, b *Build, svc ServiceSpec
 // trailing -t/-f/--push context — is unit-testable.
 func buildxArgs(builder string, d Descriptor, svc ServiceSpec, full, dockerfile, versionTag, apkBust, secretFile string, prov provenance) []string {
 	args := []string{"buildx", "build", "--builder", builder, "--progress=plain"}
-	args = append(args, platformArgs(d)...)
+	args = append(args, platformArgs(d, svc)...)
 	args = append(args,
 		"--cache-from", "type=registry,ref="+full+":buildcache",
 		"--cache-to", "type=registry,ref="+full+":buildcache,mode=max")

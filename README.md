@@ -250,6 +250,10 @@ describes. This repo's own `build.json` is a minimal example.
 | `image_prefix` | `""` | Prepended to each service name to form the image repo: `<registry>/<image_prefix><service>`. |
 | `platform.mode` | `"auto"` | `"auto"` ⇒ `--platform linux/amd64,linux/arm64`. `"fixed"` ⇒ use `platform.value` verbatim. |
 | `platform.value` | `""` | e.g. `"linux/arm64"`. Only read when `mode` is `"fixed"`. |
+| `services[].platform` | unset (inherit) | Same `{mode, value}` shape; overrides the project-level platform for that one service (e.g. `{"mode":"fixed","value":"linux/amd64"}` for an amd64-only base). A service `mode` is required when the object is present. |
+
+The trigger (`POST /v1/builds`) validates every platform and answers 400 for an unknown `mode`, a `fixed` with no `linux/<arch>[/vN][,linux/<arch>...]` value, an `auto` carrying a value, duplicate or unnamed services, or a service platform with no `mode`: these used to fall through to the multi-arch default and push an image for architectures the service may not support. A project-level `mode` left empty still means `auto`. Validation covers every service in the descriptor, not only the ones selected for the build.
+
 | `version.scheme` | `"timestamp"` | `"timestamp"` ⇒ the tag is `YYYYMMDD-HHMMSS` stamped once at build start and shared by every service in the job. `"external"` ⇒ the request's `version` field is the tag (and becomes required). |
 | `lanes.fast` | `BUILD_FAST_LANE` (2) | Max concurrent fast-lane service builds. Values ≤ 0 fall back to the env default. |
 | `lanes.slow` | `BUILD_SLOW_LANE` (1) | Max concurrent slow-lane service builds. Same fallback. |

@@ -25,6 +25,10 @@ func (a *app) handleTriggerBuild(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "descriptor.project and descriptor.services are required"})
 		return
 	}
+	if err := req.Descriptor.validate(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "descriptor." + err.Error()})
+		return
+	}
 	if req.Registry == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "registry is required"})
 		return
