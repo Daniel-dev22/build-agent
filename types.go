@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -58,6 +60,45 @@ type PlatformSpec struct {
 	Value string `json:"value,omitempty"` // e.g. "linux/arm64" when fixed
 }
 
+// platformRe is the shape of a fixed value: one or more comma-separated linux/<arch>[/<variant>].
+var platformRe = regexp.MustCompile(`^linux/[a-z0-9]+(/v[0-9]+)?(,linux/[a-z0-9]+(/v[0-9]+)?)*$`)
+
+// validate rejects a platform that would silently build for the wrong architectures. An unknown mode or
+// a fixed mode with no usable value used to fall through to the multi-arch default, which pushes an
+// image for an architecture the service may not support. An empty mode means "auto" at project level
+// (every deployed build.json is valid) but is ambiguous on a service, where nil means "inherit".
+func (p PlatformSpec) validate(where string, requireMode bool) error {
+	switch p.Mode {
+	case "":
+		if requireMode {
+			return fmt.Errorf("%s: platform.mode is required (auto | fixed)", where)
+		}
+	case "auto":
+	case "fixed":
+		if !platformRe.MatchString(p.Value) {
+			return fmt.Errorf("%s: platform.value %q is not a linux/<arch>[,linux/<arch>] list", where, p.Value)
+		}
+	default:
+		return fmt.Errorf("%s: platform.mode %q is not auto or fixed", where, p.Mode)
+	}
+	return nil
+}
+
+// validate checks the parts of a descriptor that would otherwise fail late or build the wrong thing.
+func (d Descriptor) validate() error {
+	if err := d.Platform.validate("platform", false); err != nil {
+		return err
+	}
+	for _, s := range d.Services {
+		if s.Platform != nil {
+			if err := s.Platform.validate("service "+s.Name, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 type VersionSpec struct {
 	Scheme string `json:"scheme"` // "timestamp" | "external"
 }
@@ -74,6 +115,10 @@ type ServiceSpec struct {
 	Target     string            `json:"target,omitempty"`     // buildx --target stage; empty = final stage
 	Lane       string            `json:"lane,omitempty"`       // "fast" | "slow"
 	BuildArgs  map[string]string `json:"build_args,omitempty"`
+	// Platform overrides the project-level platform for this service (nil = inherit), so one service
+	// whose base is single-arch (a Chrome sidecar is amd64-only) can build for it alone while the rest
+	// of the project stays multi-arch.
+	Platform *PlatformSpec `json:"platform,omitempty"`
 }
 
 func (s ServiceSpec) dockerfile() string {
