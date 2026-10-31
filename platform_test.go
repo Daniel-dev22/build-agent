@@ -28,6 +28,7 @@ func TestPlatformArgsServiceOverridesProject(t *testing.T) {
 		{"service fixed over project fixed", *fixed("linux/arm64"), fixed("linux/amd64"), "--platform linux/amd64"},
 		{"service auto over project fixed", *fixed("linux/arm64"), &PlatformSpec{Mode: "auto"}, multi},
 		{"unset project, service fixed", PlatformSpec{}, fixed("linux/amd64"), "--platform linux/amd64"},
+		{"a value without fixed mode is not applied", PlatformSpec{Mode: "auto", Value: "linux/amd64"}, nil, multi},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := strings.Join(platformArgs(Descriptor{Platform: tc.project}, ServiceSpec{Name: "x", Platform: tc.svc}), " ")
@@ -76,6 +77,16 @@ func TestDescriptorPlatformValidation(t *testing.T) {
 		{"service empty mode is ambiguous", svc(&PlatformSpec{}), false},
 		{"service mode typo", svc(&PlatformSpec{Mode: "amd64"}), false},
 		{"service bad value", svc(fixed("windows/amd64")), false},
+		{"trailing junk", Descriptor{Platform: *fixed("linux/amd64 junk")}, false},
+		{"trailing comma", Descriptor{Platform: *fixed("linux/amd64,")}, false},
+		{"leading junk", Descriptor{Platform: *fixed("xlinux/amd64")}, false},
+		{"empty arch", Descriptor{Platform: *fixed("linux/")}, false},
+		{"mode case", Descriptor{Platform: PlatformSpec{Mode: "Auto"}}, false},
+		{"auto with a value", Descriptor{Platform: PlatformSpec{Mode: "auto", Value: "linux/amd64"}}, false},
+		{"service auto with a value", svc(&PlatformSpec{Mode: "auto", Value: "linux/amd64"}), false},
+		{"second service bad", Descriptor{Services: []ServiceSpec{{Name: "a", Platform: fixed("linux/amd64")}, {Name: "b", Platform: fixed("nope")}}}, false},
+		{"unnamed service", Descriptor{Services: []ServiceSpec{{}}}, false},
+		{"duplicate service", Descriptor{Services: []ServiceSpec{{Name: "a"}, {Name: "a"}}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := tc.d.validate(); (err == nil) != tc.ok {

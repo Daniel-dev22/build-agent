@@ -74,6 +74,9 @@ func (p PlatformSpec) validate(where string, requireMode bool) error {
 			return fmt.Errorf("%s: platform.mode is required (auto | fixed)", where)
 		}
 	case "auto":
+		if p.Value != "" {
+			return fmt.Errorf("%s: platform.value %q is ignored in auto mode (use mode fixed)", where, p.Value)
+		}
 	case "fixed":
 		if !platformRe.MatchString(p.Value) {
 			return fmt.Errorf("%s: platform.value %q is not a linux/<arch>[,linux/<arch>] list", where, p.Value)
@@ -89,7 +92,17 @@ func (d Descriptor) validate() error {
 	if err := d.Platform.validate("platform", false); err != nil {
 		return err
 	}
+	seen := map[string]bool{}
 	for _, s := range d.Services {
+		// Two services with one name push one image tag: with per-service platforms the race could
+		// flip the pushed architecture.
+		if s.Name == "" {
+			return fmt.Errorf("a service has no name")
+		}
+		if seen[s.Name] {
+			return fmt.Errorf("service %s is listed twice", s.Name)
+		}
+		seen[s.Name] = true
 		if s.Platform != nil {
 			if err := s.Platform.validate("service "+s.Name, true); err != nil {
 				return err
