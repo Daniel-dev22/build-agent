@@ -266,7 +266,7 @@ func buildxArgs(builder string, d Descriptor, svc ServiceSpec, full, dockerfile,
 	args = append(args, platformArgs(d, svc)...)
 	args = append(args,
 		"--cache-from", "type=registry,ref="+full+":buildcache",
-		"--cache-to", "type=registry,ref="+full+":buildcache,mode=max")
+		"--cache-to", "type=registry,ref="+full+":buildcache,mode=max,ignore-error=true")
 	args = append(args, renderBuildArgs(d, svc, versionTag, apkBust)...)
 	if svc.Target != "" {
 		args = append(args, "--target", svc.Target)

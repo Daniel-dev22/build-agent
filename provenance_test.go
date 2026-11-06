@@ -267,7 +267,7 @@ func TestBuildxArgsCarriesLabelsBeforeTheTail(t *testing.T) {
 		"buildx", "build", "--builder", "b", "--progress=plain",
 		"--platform", "linux/amd64",
 		"--cache-from", "type=registry,ref=reg/app:buildcache",
-		"--cache-to", "type=registry,ref=reg/app:buildcache,mode=max",
+		"--cache-to", "type=registry,ref=reg/app:buildcache,mode=max,ignore-error=true",
 		"-t", "reg/app:latest", "-f", "Dockerfile", "--push", ".",
 	}
 	got := buildxArgs("b", d, svc, "reg/app", "Dockerfile", "v", "a", "", provenance{})
