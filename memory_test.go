@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseBytes(t *testing.T) {
@@ -64,6 +65,7 @@ type fakeHost struct {
 	mem, swap       int64
 	creates         int
 	forceRm         int
+	volumeRm        int
 	calls           []string
 	dropSwap        bool // daemon without swap-limit support: swap reads back -1
 	createIgnoresCap bool // buildx create never applies the opts (even on a fresh container)
@@ -89,11 +91,19 @@ func (h *fakeHost) fn(_ context.Context, args ...string) (string, error) {
 		return strconv.FormatInt(h.mem, 10) + " " + strconv.FormatInt(swap, 10), nil
 	case args[0] == "rm" && args[1] == "-f":
 		h.exists = false
-	case strings.HasPrefix(line, "buildx rm --keep-state"):
+	case args[0] == "volume" && args[1] == "rm":
+		h.volumeRm++
+	case strings.HasPrefix(line, "buildx rm"):
+		// A real daemon: removing a builder that is not in the store fails, and it never touches a
+		// container it does not know about (the store-lost-on-redeploy case).
+		if !h.storeOK {
+			return "ERROR: no builder found", errors.New("exit 1")
+		}
 		h.storeOK = false
-	case strings.Contains(line, "buildx rm") && strings.Contains(line, "--force"):
-		h.forceRm++
-		h.storeOK, h.exists = false, false
+		if strings.Contains(line, "--force") {
+			h.forceRm++
+			h.exists = false
+		}
 	case strings.HasPrefix(line, "buildx create"):
 		h.creates++
 		if h.storeOK {
@@ -229,7 +239,87 @@ func TestRecreateEnvIsHonouredOncePerAgentLifetime(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if h.forceRm != 1 {
-		t.Fatalf("CC_RECREATE_BUILDER deleted the cache volume %d times; want once", h.forceRm)
+	if h.volumeRm != 1 {
+		t.Fatalf("CC_RECREATE_BUILDER removed the cache volume %d times; want once", h.volumeRm)
+	}
+}
+
+// Setting CC_RECREATE_BUILDER means recreating the agent container, which EMPTIES the buildx store.
+// Keyed on the store the request was a silent no-op (buildx rm fails, container and volume survive,
+// create just restarts them). It must act on the container and its state volume.
+func TestRecreateEnvActsOnTheContainerWhenTheStoreIsLost(t *testing.T) {
+	t.Setenv("CC_RECREATE_BUILDER", "1")
+	h := &fakeHost{storeOK: false, exists: true, mem: 7 << 30, swap: 7 << 30}
+	e := hostEngine(h)
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err != nil {
+		t.Fatal(err)
+	}
+	if h.volumeRm != 1 || !h.did("rm -f buildx_buildkit_b0") || !h.did("volume rm buildx_buildkit_b0_state") {
+		t.Fatalf("clean recreate did not remove container + state volume: %v", h.calls)
+	}
+	if h.creates != 1 || h.mem != 7<<30 {
+		t.Fatalf("not recreated capped: creates=%d mem=%d", h.creates, h.mem)
+	}
+}
+
+func TestRecreateEnvIsDeferredWhileBuildsRun(t *testing.T) {
+	t.Setenv("CC_RECREATE_BUILDER", "1")
+	h := &fakeHost{storeOK: true, exists: true, mem: 7 << 30, swap: 7 << 30}
+	e := hostEngine(h)
+	e.ensured.Add(1)
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err == nil || h.volumeRm != 0 {
+		t.Fatalf("must not delete the cache volume under a job: err=%v vol=%d", err, h.volumeRm)
+	}
+	e.ensured.Add(-1)
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err != nil || h.volumeRm != 1 {
+		t.Fatalf("idle: err=%v vol=%d", err, h.volumeRm)
+	}
+}
+
+// A job that already passed ensureBuilder (e.g. running pre_build) can be admitted any moment; the
+// repair must not remove the container under it.
+func TestRepairWaitsForJobsThatPassedEnsure(t *testing.T) {
+	h := &fakeHost{storeOK: true, exists: true}
+	e := hostEngine(h)
+	e.ensured.Add(1)
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err == nil || h.did("rm -f") {
+		t.Fatalf("repair under an ensured job: err=%v calls=%v", err, h.calls)
+	}
+}
+
+// ---- MED-1: every docker call and the setup phase are bounded --------------------------------------
+
+func TestDockerCallsHaveTheirOwnTimeout(t *testing.T) {
+	e := &engine{cfg: Config{Builder: "b", DockerTimeout: 50 * time.Millisecond}}
+	e.docker = func(ctx context.Context, _ ...string) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	start := time.Now()
+	if _, err := e.dockerRun(context.Background(), "inspect", "x"); err == nil || time.Since(start) > 2*time.Second {
+		t.Fatalf("a wedged daemon must not hang the call: err=%v after %v", err, time.Since(start))
+	}
+}
+
+func TestHungSetupFailsItsJobAndReleasesTheBuilderLock(t *testing.T) {
+	e := newRunEngine(t, Config{FastLane: 1, SlowLane: 1, SetupTimeout: 150 * time.Millisecond})
+	hang := true
+	e.docker = func(ctx context.Context, _ ...string) (string, error) {
+		if hang {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		return "", nil
+	}
+	e.execBuildx = fakeBuildx(nil)
+	d := Descriptor{Project: "p", Services: []ServiceSpec{{Name: "a", Dockerfile: "Dockerfile"}}}
+	b := runJob(t, e, d, BuildRequest{})
+	if st := b.snapshot(); st.State != BuildFailed {
+		t.Fatalf("a hung ensureBuilder must fail its job at the setup deadline: %s", st.State)
+	}
+	hang = false
+	b2 := runJob(t, e, d, BuildRequest{})
+	if st := b2.snapshot(); st.State != BuildCompleted {
+		t.Fatalf("builderMu was not released, next job: %s %s", st.State, st.ErrorMsg)
 	}
 }

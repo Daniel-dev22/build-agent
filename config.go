@@ -45,6 +45,14 @@ type Config struct {
 	// whose manifest sets no `memory`. Only meaningful when a ceiling is set.
 	MemoryDefault int64
 
+	// SetupTimeout (BUILD_SETUP_TIMEOUT, default 20m) bounds a job's non-admission phases (token vend,
+	// clones, builder ensure, pre_build, cache validation). Admission has no deadline by design;
+	// BUILD_TIMEOUT starts when a service is admitted. DockerTimeout (BUILD_DOCKER_TIMEOUT, default
+	// 15m) bounds every single docker CLI call the agent makes outside a build (builder
+	// inspect/create/repair, post-build prune), so a wedged daemon cannot hold builderMu forever.
+	SetupTimeout  time.Duration
+	DockerTimeout time.Duration
+
 	// PrivateRepoOwners lists GitHub owners/orgs whose repos are treated as
 	// private (⇒ vend an installation token) when BuildRequest.Private is unset.
 	// Empty (the default) ⇒ nothing is inferred private.
@@ -76,6 +84,8 @@ func loadConfig() Config {
 		RetentionKeepDefault: getEnvInt("REGISTRY_RETENTION_KEEP", 15),
 		GitTimeout:           getEnvDuration("GIT_TIMEOUT", 5*time.Minute),
 		BuildTimeout:         getEnvDuration("BUILD_TIMEOUT", 60*time.Minute),
+		SetupTimeout:         getEnvDuration("BUILD_SETUP_TIMEOUT", 20*time.Minute),
+		DockerTimeout:        getEnvDuration("BUILD_DOCKER_TIMEOUT", 15*time.Minute),
 		PrivateRepoOwners:    getEnvList("PRIVATE_REPO_OWNERS"),
 	}
 	cfg.MemoryCeiling = requireBytes("BUILD_MEMORY_CEILING", "")

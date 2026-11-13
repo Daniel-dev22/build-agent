@@ -21,13 +21,14 @@ func TestEncodedAuthHeaderNeverLeavesTheEnvironment(t *testing.T) {
 
 	cmd := cloneCmd(context.Background(), "git@github.com:o/r.git", "main", "/tmp/d", testToken)
 	for _, a := range cmd.Args {
-		if strings.Contains(a, enc) || a == "-c" || a == "--config" || strings.HasPrefix(a, "--config=") {
+		// any -c<k=v> / -ck=v / --config...: git clone persists those into .git/config
+		if strings.Contains(a, enc) || strings.HasPrefix(a, "-c") || strings.HasPrefix(a, "--config") {
 			t.Fatalf("auth must travel in the environment only (git clone -c persists into .git/config): %v", cmd.Args)
 		}
 	}
 	for _, c := range shaCmds(context.Background(), "git@github.com:o/r.git", strings.Repeat("a", 40), "/tmp/d", testToken) {
 		for _, a := range c.Args {
-			if strings.Contains(a, testToken) || strings.Contains(a, enc) || a == "-c" {
+			if strings.Contains(a, testToken) || strings.Contains(a, enc) || strings.HasPrefix(a, "-c") || strings.HasPrefix(a, "--config") {
 				t.Fatalf("sha fetch leaks credentials in argv: %v", c.Args)
 			}
 		}
@@ -191,3 +192,84 @@ func TestBuildTimeoutStillBoundsAnAdmittedBuild(t *testing.T) {
 }
 
 var _ = exec.Command
+
+// A SHA that names an annotated tag OBJECT peels to a different commit on checkout; the pin must
+// then fail loudly rather than build a commit nobody pinned.
+func TestShaPinOfAnAnnotatedTagObjectFailsTheMismatchCheck(t *testing.T) {
+	fx := newGitFixture(t, "kit")
+	if fx.annotSHA == "" || fx.annotSHA == fx.tagSHA {
+		t.Fatal("fixture must produce a tag object distinct from its commit")
+	}
+	e := &engine{cfg: Config{GitTimeout: 30 * time.Second}}
+	d := Descriptor{Contexts: map[string]ContextSpec{"kit": {Repo: fx.repoURLFor("kit"), Ref: fx.annotSHA}}}
+	_, _, err := e.cloneContexts(context.Background(), newJob(t), d, BuildRequest{}, "")
+	if err == nil || !strings.Contains(err.Error(), "pinned") {
+		t.Fatalf("want the pinned-but-checked-out mismatch error, got %v", err)
+	}
+}
+
+// ---- LOW-1: retention escalation ------------------------------------------------------------------
+
+func retentionServer(t *testing.T, headStatus func(tag string) int) (*registryClient, string, *[]string) {
+	t.Helper()
+	var deleted []string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tag := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write([]byte("{\"tags\":[\"20260101-000001\",\"20260101-000002\",\"20260101-000003\",\"20260101-000004\",\"gone\"]}"))
+		case http.MethodHead:
+			if st := headStatus(tag); st != http.StatusOK {
+				w.WriteHeader(st)
+				return
+			}
+			w.Header().Set("Docker-Content-Digest", "sha256:"+tag)
+		case http.MethodDelete:
+			deleted = append(deleted, tag)
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return &registryClient{hc: srv.Client()}, strings.TrimPrefix(srv.URL, "https://"), &deleted
+}
+
+func TestRetentionIgnoresADanglingLiveTagButStopsOnA5xx(t *testing.T) {
+	status := http.StatusNotFound
+	rc, reg, deleted := retentionServer(t, func(tag string) int {
+		if tag == "gone" {
+			return status
+		}
+		return http.StatusOK
+	})
+	rc.pruneOldTags(context.Background(), reg, "img", 2)
+	if len(*deleted) == 0 {
+		t.Fatal("a 404 live tag protects nothing: the prune must proceed")
+	}
+	*deleted = nil
+	status = http.StatusInternalServerError
+	rc.pruneOldTags(context.Background(), reg, "img", 2)
+	if len(*deleted) != 0 {
+		t.Fatalf("a 5xx on a live tag must stop the prune: %v", *deleted)
+	}
+}
+
+func TestRetentionCountsConsecutiveSkipsAndResetsOnSuccess(t *testing.T) {
+	status := http.StatusInternalServerError
+	rc, reg, _ := retentionServer(t, func(tag string) int {
+		if tag == "gone" {
+			return status
+		}
+		return http.StatusOK
+	})
+	for i := 0; i < 3; i++ {
+		rc.pruneOldTags(context.Background(), reg, "img", 2)
+	}
+	if rc.skips["img"] != 3 {
+		t.Fatalf("consecutive skips = %d, want 3 (it is surfaced as an Error from the third)", rc.skips["img"])
+	}
+	status = http.StatusOK
+	rc.pruneOldTags(context.Background(), reg, "img", 2)
+	if rc.skips["img"] != 0 {
+		t.Fatalf("a completed prune must reset the count, got %d", rc.skips["img"])
+	}
+}

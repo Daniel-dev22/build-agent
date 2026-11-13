@@ -96,6 +96,11 @@ func builderContainer(builder string) string { return "buildx_buildkit_" + build
 
 // dockerRun runs docker and returns its trimmed combined output. e.docker lets tests substitute it.
 func (e *engine) dockerRun(ctx context.Context, args ...string) (string, error) {
+	if e.cfg.DockerTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.cfg.DockerTimeout)
+		defer cancel()
+	}
 	if e.docker != nil {
 		return e.docker(ctx, args...)
 	}
@@ -137,6 +142,22 @@ func (e *engine) repairBuilder(ctx context.Context) error {
 	}
 	// Drop the (possibly stale) store entry so `buildx create` of the same name is accepted. No
 	// --force and no volume removal: --keep-state.
+	_, _ = e.dockerRun(ctx, "buildx", "rm", "--keep-state", e.cfg.Builder)
+	return nil
+}
+
+// recreateClean is the operator's CC_RECREATE_BUILDER: a clean builder, STATE INCLUDED. Keyed on the
+// container and its named state volume, not on the buildx store (which is empty exactly when the
+// env var could be set, since setting it means recreating the agent container). Caller guarantees
+// nothing is building.
+func (e *engine) recreateClean(ctx context.Context) error {
+	c := builderContainer(e.cfg.Builder)
+	if out, err := e.dockerRun(ctx, "rm", "-f", c); err != nil && !strings.Contains(strings.ToLower(out), "no such") {
+		return fmt.Errorf("remove builder container: %w: %s", err, out)
+	}
+	if out, err := e.dockerRun(ctx, "volume", "rm", c+"_state"); err != nil && !strings.Contains(strings.ToLower(out), "no such") {
+		return fmt.Errorf("remove builder state volume: %w: %s", err, out)
+	}
 	_, _ = e.dockerRun(ctx, "buildx", "rm", "--keep-state", e.cfg.Builder)
 	return nil
 }

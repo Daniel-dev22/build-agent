@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -79,6 +80,7 @@ type engine struct {
 	sched *scheduler
 
 	builderMu sync.Mutex // serializes ensureBuilder's inspect-then-create
+	ensured   atomic.Int32 // jobs past ensureBuilder and not yet finished
 	recreated bool       // CC_RECREATE_BUILDER already honoured (guarded by builderMu)
 }
 
@@ -183,10 +185,15 @@ func (e *engine) ensureBuilder(ctx context.Context, b *Build) error {
 	if recreate {
 		// Explicit operator request, honoured once per agent lifetime (it used to fire on every job
 		// while set, deleting the cache volume each time). Clean builder, state included.
+		if e.builderBusy() {
+			return fmt.Errorf("CC_RECREATE_BUILDER requested but builds are running; it is honoured by the next job once idle")
+		}
 		e.recreated = true
-		_, _ = e.dockerRun(ctx, "buildx", "rm", name, "--force")
+		if err := e.recreateClean(ctx); err != nil {
+			return err
+		}
 	} else if exists && !capOK {
-		if e.sched != nil && e.sched.running.Load() > 0 {
+		if e.builderBusy() {
 			return fmt.Errorf("builder %s does not carry BUILD_MEMORY_CEILING (%d bytes) and builds are running; it is repaired by the next job once idle", name, e.cfg.MemoryCeiling)
 		}
 		b.appendLine("[builder] repairing: container lacks the memory cap, recreating it (state volume kept)")
@@ -213,6 +220,13 @@ func (e *engine) ensureBuilder(ctx context.Context, b *Build) error {
 	}
 	b.appendLine("[builder] created " + name)
 	return nil
+}
+
+// builderBusy reports whether anything could be using the builder: a service inside buildx, or a job
+// that already passed ensureBuilder and has not finished (it may be about to be admitted). Repairs
+// and recreates are only done when neither holds, which closes the repair-versus-admission race.
+func (e *engine) builderBusy() bool {
+	return (e.sched != nil && e.sched.running.Load() > 0) || e.ensured.Load() > 0
 }
 
 func (e *engine) rotateTags(ctx context.Context, full string) {
@@ -416,6 +430,16 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 	// only part that cannot be known yet — it needs the clone to exist.
 	prov := provenanceFor(req)
 
+	// Setup phases (vend, clones, builder, pre_build, cache check) run under their own deadline.
+	// Admission below has none, and BUILD_TIMEOUT starts per service at admission, so a hung setup
+	// step fails ITS job and releases builderMu instead of wedging every later job.
+	jobCtx := ctx
+	if e.cfg.SetupTimeout > 0 {
+		var cancelSetup context.CancelFunc
+		ctx, cancelSetup = context.WithTimeout(ctx, e.cfg.SetupTimeout)
+		defer cancelSetup()
+	}
+
 	// One token covers the app repo and every named-context repo that is private: it is vended once,
 	// authenticates each clone through the environment (gitclone.go), and is handed to buildx only as
 	// the id=ghtoken secret. It is never a URL, a context file or a build arg.
@@ -471,6 +495,8 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 		fail(err.Error())
 		return
 	}
+	e.ensured.Add(1) // from here this job may be admitted at any moment: no repair of the builder
+	defer e.ensured.Add(-1)
 
 	// Project pre-build hook: run the descriptor's PreBuild commands in the freshly
 	// populated workdir before any service builds — e.g. a `make version` step that
@@ -508,6 +534,7 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 		retentionKeep = *d.RetentionKeep
 	}
 
+	ctx = jobCtx // setup is over: back to the job context (no deadline) for admission and builds
 	limits := e.sched.limitsFor(d)
 	var wg sync.WaitGroup
 	for _, svc := range services {

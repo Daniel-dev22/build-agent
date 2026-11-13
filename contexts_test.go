@@ -19,6 +19,7 @@ type gitFixture struct {
 	root       string
 	headSHA    string
 	tagSHA     string
+	annotSHA   string // the annotated tag OBJECT (peels to tagSHA)
 	repoURLFor func(name string) string
 }
 
@@ -50,6 +51,8 @@ func newGitFixture(t *testing.T, names ...string) *gitFixture {
 		run(dir, "tag", "v1")
 		run(dir, "config", "uploadpack.allowAnySHA1InWant", "true")
 		f.tagSHA = run(dir, "rev-parse", "HEAD")
+		run(dir, "tag", "-a", "-m", "x", "v1a")
+		f.annotSHA = run(dir, "rev-parse", "v1a")
 		must(t, os.WriteFile(filepath.Join(dir, "v"), []byte("2"), 0o644))
 		run(dir, "commit", "-q", "-am", "two")
 		f.headSHA = run(dir, "rev-parse", "HEAD")

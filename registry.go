@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -32,6 +33,9 @@ const manifestAccept = "application/vnd.oci.image.index.v1+json," +
 // host or these best-effort calls simply no-op.
 type registryClient struct {
 	hc *http.Client
+
+	skipMu sync.Mutex
+	skips  map[string]int // consecutive skipped retention runs per image
 }
 
 func newRegistryClient() *registryClient {
@@ -100,17 +104,40 @@ func (r *registryClient) validateCache(ctx context.Context, registry, image stri
 // resolveDigest returns the Docker-Content-Digest for a tag (index or manifest),
 // or "" if absent/unreachable — what DELETE must target to drop the whole tag.
 func (r *registryClient) resolveDigest(ctx context.Context, base, ref string) string {
+	d, _, _ := r.resolveDigestStatus(ctx, base, ref)
+	return d
+}
+
+// resolveDigestStatus is resolveDigest with the outcome: the HTTP status (0 when the request itself
+// failed, e.g. a timeout) and the transport error.
+func (r *registryClient) resolveDigestStatus(ctx context.Context, base, ref string) (digest string, status int, err error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, base+"/manifests/"+ref, nil)
 	req.Header.Set("Accept", manifestAccept)
 	resp, err := r.hc.Do(req)
 	if err != nil {
-		return ""
+		return "", 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return "", resp.StatusCode, nil
 	}
-	return resp.Header.Get("Docker-Content-Digest")
+	return resp.Header.Get("Docker-Content-Digest"), resp.StatusCode, nil
+}
+
+// noteRetention tracks consecutive skipped prunes per image so a permanently stuck retention is
+// loud: a Warn per skip, an Error from the third consecutive one. A completed prune resets it.
+func (r *registryClient) noteRetention(image string, skipped bool) int {
+	r.skipMu.Lock()
+	defer r.skipMu.Unlock()
+	if r.skips == nil {
+		r.skips = map[string]int{}
+	}
+	if !skipped {
+		delete(r.skips, image)
+		return 0
+	}
+	r.skips[image]++
+	return r.skips[image]
 }
 
 // deleteManifest DELETEs a manifest by digest. 2xx (deleted) and 404 (already
@@ -195,13 +222,23 @@ func (r *registryClient) pruneOldTags(ctx context.Context, registry, image strin
 		if _, isStale := staleSet[t]; isStale {
 			continue
 		}
-		d := r.resolveDigest(ctx, base, t)
+		d, status, rerr := r.resolveDigestStatus(ctx, base, t)
+		if status == http.StatusNotFound {
+			continue // the tag is gone: it protects nothing
+		}
 		if d == "" {
-			slog.Warn("registry retention skipped: cannot resolve a live tag's digest", "image", image, "tag", t)
+			n := r.noteRetention(image, true)
+			lvl := slog.LevelWarn
+			if n >= 3 {
+				lvl = slog.LevelError // stuck retention: the store grows until this is fixed
+			}
+			slog.Log(ctx, lvl, "registry retention skipped: cannot resolve a live tag's digest",
+				"image", image, "tag", t, "status", status, "error", rerr, "consecutive_skips", n)
 			return
 		}
 		live[d] = struct{}{}
 	}
+	r.noteRetention(image, false)
 	seen := map[string]struct{}{}
 	deleted := 0
 	for _, t := range stale {
