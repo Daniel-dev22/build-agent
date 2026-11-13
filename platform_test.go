@@ -45,7 +45,7 @@ func TestBuildxArgsPlatformIsPerService(t *testing.T) {
 		{Name: "api"}, {Name: "browser", Platform: fixed("linux/amd64")},
 	}}
 	args := func(s ServiceSpec) string {
-		return strings.Join(buildxArgs("b", d, s, "reg/"+s.Name, s.dockerfile(), "v", "bust", "", provenance{}), " ")
+		return strings.Join(buildxArgs("b", d, s, "reg/"+s.Name, s.dockerfile(), "v", "bust", "", provenance{}, buildExtras{}), " ")
 	}
 	if got := args(d.Services[0]); !strings.Contains(got, "--platform linux/amd64,linux/arm64") {
 		t.Errorf("api must stay multi-arch: %q", got)

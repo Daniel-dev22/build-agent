@@ -89,9 +89,11 @@ func (r *buildRegistry) start(parentCtx context.Context, req BuildRequest) *Buil
 
 	go func() {
 		defer cancel()
-		ctx, c2 := context.WithTimeout(jobCtx, r.cfg.BuildTimeout)
-		defer c2()
-		r.eng.run(ctx, b, req, r.onChange(b), r.fleetTrigger)
+		// No whole-job deadline: time spent queued behind other jobs for a lane slot or memory
+		// (admission) must not consume BUILD_TIMEOUT, or a deploy queued behind a long Android build
+		// would time out doing nothing. engine.run applies BUILD_TIMEOUT per service, from the moment
+		// that service is admitted; clones are bounded by GIT_TIMEOUT.
+		r.eng.run(jobCtx, b, req, r.onChange(b), r.fleetTrigger)
 	}()
 	return b
 }

@@ -50,7 +50,7 @@ func TestBuildxArgsTarget(t *testing.T) {
 	d := Descriptor{Platform: PlatformSpec{Mode: "fixed", Value: "linux/amd64"}}
 	// With a target: --target must appear, before the trailing -t/-f/--push tail.
 	svc := ServiceSpec{Name: "app", Context: ".", Dockerfile: "docker/main/Dockerfile", Target: "runtime"}
-	args := buildxArgs("test-builder", d, svc, "reg/app", "docker/main/Dockerfile", "20260101-000000", "2026-01", "", provenance{})
+	args := buildxArgs("test-builder", d, svc, "reg/app", "docker/main/Dockerfile", "20260101-000000", "2026-01", "", provenance{}, buildExtras{})
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--target runtime") {
 		t.Errorf("expected --target runtime; got %q", joined)
@@ -64,7 +64,7 @@ func TestBuildxArgsTarget(t *testing.T) {
 		t.Errorf("--target must precede the --push tail; got %q", joined)
 	}
 	// Without a target: no --target flag at all.
-	none := buildxArgs("test-builder", d, ServiceSpec{Name: "x", Dockerfile: "x/Dockerfile"}, "reg/x", "x/Dockerfile", "v", "a", "", provenance{})
+	none := buildxArgs("test-builder", d, ServiceSpec{Name: "x", Dockerfile: "x/Dockerfile"}, "reg/x", "x/Dockerfile", "v", "a", "", provenance{}, buildExtras{})
 	if strings.Contains(strings.Join(none, " "), "--target") {
 		t.Errorf("no Target => no --target flag; got %q", strings.Join(none, " "))
 	}
@@ -92,9 +92,9 @@ func TestRepoSlugAndTokenURL(t *testing.T) {
 			t.Errorf("repoSlug(%q)=%q want %q", in, got, want)
 		}
 	}
-	url := githubTokenURL("git@github.com:example-org/example-repo.git", "TOK")
-	if url != "https://x-access-token:TOK@github.com/example-org/example-repo.git" {
-		t.Errorf("token url: %q", url)
+	url := githubCloneURL("git@github.com:example-org/example-repo.git")
+	if url != "https://github.com/example-org/example-repo.git" {
+		t.Errorf("clone url: %q", url)
 	}
 }
 

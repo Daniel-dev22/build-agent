@@ -37,6 +37,22 @@ type Config struct {
 	GitTimeout           time.Duration // per-clone timeout
 	BuildTimeout         time.Duration // hard ceiling per build job
 
+	// MemoryCeiling (BUILD_MEMORY_CEILING, e.g. "7g") is the hard memory cap on the persistent
+	// BuildKit builder (memory = memory-swap) AND the budget that per-service manifest `memory`
+	// reservations are admitted against. 0 = unset: no cap, no reservations (previous behaviour).
+	MemoryCeiling int64
+	// MemoryDefault (BUILD_MEMORY_DEFAULT, default "1g") is the reservation charged to a service
+	// whose manifest sets no `memory`. Only meaningful when a ceiling is set.
+	MemoryDefault int64
+
+	// SetupTimeout (BUILD_SETUP_TIMEOUT, default 20m) bounds a job's non-admission phases (token vend,
+	// clones, builder ensure, pre_build, cache validation). Admission has no deadline by design;
+	// BUILD_TIMEOUT starts when a service is admitted. DockerTimeout (BUILD_DOCKER_TIMEOUT, default
+	// 15m) bounds every single docker CLI call the agent makes outside a build (builder
+	// inspect/create/repair, post-build prune), so a wedged daemon cannot hold builderMu forever.
+	SetupTimeout  time.Duration
+	DockerTimeout time.Duration
+
 	// PrivateRepoOwners lists GitHub owners/orgs whose repos are treated as
 	// private (⇒ vend an installation token) when BuildRequest.Private is unset.
 	// Empty (the default) ⇒ nothing is inferred private.
@@ -68,8 +84,12 @@ func loadConfig() Config {
 		RetentionKeepDefault: getEnvInt("REGISTRY_RETENTION_KEEP", 15),
 		GitTimeout:           getEnvDuration("GIT_TIMEOUT", 5*time.Minute),
 		BuildTimeout:         getEnvDuration("BUILD_TIMEOUT", 60*time.Minute),
+		SetupTimeout:         getEnvDuration("BUILD_SETUP_TIMEOUT", 20*time.Minute),
+		DockerTimeout:        getEnvDuration("BUILD_DOCKER_TIMEOUT", 15*time.Minute),
 		PrivateRepoOwners:    getEnvList("PRIVATE_REPO_OWNERS"),
 	}
+	cfg.MemoryCeiling = requireBytes("BUILD_MEMORY_CEILING", "")
+	cfg.MemoryDefault = requireBytes("BUILD_MEMORY_DEFAULT", "1g")
 	tok, err := readBearerToken(cfg.BearerTokenFile)
 	if err != nil {
 		slog.Error("bearer token unreadable — cannot authenticate to controller",
@@ -133,6 +153,18 @@ func getEnvInt(k string, def int) int {
 	if err != nil {
 		slog.Warn("invalid int env var, using default", "var", k, "value", v, "default", def)
 		return def
+	}
+	return n
+}
+
+// requireBytes parses a size env var. A malformed value is fatal, unlike getEnvInt's fallback:
+// silently falling back here would run builds with NO memory cap on a host the cap exists to protect.
+func requireBytes(k, def string) int64 {
+	v := getEnv(k, def)
+	n, err := parseBytes(v)
+	if err != nil {
+		slog.Error("invalid size env var", "var", k, "value", v, "error", err)
+		os.Exit(1)
 	}
 	return n
 }

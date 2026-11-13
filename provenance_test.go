@@ -244,7 +244,7 @@ func TestBuildxArgsCarriesLabelsBeforeTheTail(t *testing.T) {
 	d := Descriptor{Platform: PlatformSpec{Mode: "fixed", Value: "linux/amd64"}}
 	svc := ServiceSpec{Name: "app", Context: ".", Dockerfile: "Dockerfile"}
 	prov := provenance{Context: contextGit, Repo: "https://github.com/o/r.git", Ref: "0.19", Revision: "deadbeef"}
-	args := buildxArgs("b", d, svc, "reg/app", "Dockerfile", "v", "a", "", prov)
+	args := buildxArgs("b", d, svc, "reg/app", "Dockerfile", "v", "a", "", prov, buildExtras{})
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		labelSource + "=https://github.com/o/r.git",
@@ -260,7 +260,7 @@ func TestBuildxArgsCarriesLabelsBeforeTheTail(t *testing.T) {
 	if li, pi := strings.LastIndex(joined, "--label"), strings.Index(joined, "--push"); li < 0 || pi < 0 || li > pi {
 		t.Errorf("labels must precede the -t/-f/--push tail; got %q", joined)
 	}
-	// A build with no provenance must produce the argv it did before this change.
+	// A build with no provenance must produce the argv it did before provenance existed (the versioned tag is now pushed by the build itself).
 	// Compared against a golden slice, not "does not contain --label": the latter
 	// passes for any OTHER flag this function might grow by accident.
 	want := []string{
@@ -268,9 +268,9 @@ func TestBuildxArgsCarriesLabelsBeforeTheTail(t *testing.T) {
 		"--platform", "linux/amd64",
 		"--cache-from", "type=registry,ref=reg/app:buildcache",
 		"--cache-to", "type=registry,ref=reg/app:buildcache,mode=max",
-		"-t", "reg/app:latest", "-f", "Dockerfile", "--push", ".",
+		"-t", "reg/app:latest", "-t", "reg/app:v", "-f", "Dockerfile", "--push", ".",
 	}
-	got := buildxArgs("b", d, svc, "reg/app", "Dockerfile", "v", "a", "", provenance{})
+	got := buildxArgs("b", d, svc, "reg/app", "Dockerfile", "v", "a", "", provenance{}, buildExtras{})
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("zero provenance must reproduce the pre-phase argv exactly\n want %v\n  got %v", want, got)
 	}
@@ -544,7 +544,7 @@ func TestBuildServicePassesItsProvenanceIntoTheArgv(t *testing.T) {
 	// tagVersioned/pruneOldTags would need docker; the seam returns early so the
 	// argv is what we assert on.
 	_, err := e.buildService(context.Background(), b, Descriptor{}, ServiceSpec{Name: "app", Dockerfile: "Dockerfile"},
-		"reg", "v", "a", "", prov, false, 3, nil)
+		"reg", "v", "a", "", prov, false, 3, nil, buildExtras{})
 	if err == nil {
 		t.Fatal("expected the seam's sentinel error")
 	}

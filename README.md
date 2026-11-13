@@ -529,3 +529,15 @@ Sibling agents built on the same kit:
 ## License
 
 [MIT](LICENSE) © 2026 Daniel-dev22
+
+## Android / artifact builds (P2 additions)
+
+Descriptor and request fields, all optional; every existing build.json stays valid.
+
+- Agent-wide lanes: BUILD_FAST_LANE / BUILD_SLOW_LANE bind across ALL concurrent jobs. A descriptor lanes block may only lower them for its own job.
+- Memory: BUILD_MEMORY_CEILING (e.g. 7g) is a hard cap (memory = memory-swap) on the persistent BuildKit builder, applied at startup (rm --keep-state keeps the cache volume). Per-service memory (e.g. 6g) is a RESERVATION admitted against the ceiling (FIFO); above the ceiling the trigger is rejected with a 400. Services without memory reserve BUILD_MEMORY_DEFAULT (1g). Unset ceiling = previous behaviour.
+- platform: per service, e.g. {mode: fixed, value: linux/amd64} (already supported; the default stays multi-arch).
+- contexts: {kit: {repo, ref}} cloned with the job token, ref resolved to a SHA, passed as --build-context kit=DIR. The request may override a ref with context_refs: {kit: ref}.
+- skip_latest (service): push only the versioned tag, leave :latest and :stable alone (artifact images such as a FROM scratch AAB). Retention keeps the newest N timestamp tags and never deletes a digest still used by a kept tag or :latest.
+- Job result: revision (app SHA), contexts.NAME.revision, and per service tag + digest. Consumers pull tag@digest, never :latest.
+- Clone auth is an http.extraheader env value; the token is never in a URL, argv or .git/config.

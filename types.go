@@ -30,6 +30,10 @@ type BuildRequest struct {
 	Services   []string   `json:"services,omitempty"`    // subset to build; empty = all
 	Private    *bool      `json:"private,omitempty"`     // nil = infer from repo host/org
 	TriggerKey string     `json:"trigger_key,omitempty"`
+	// ContextRefs pins a ref per named context declared in the descriptor (name -> tag/branch/commit),
+	// overriding that context's descriptor ref. Only the ref is overridable: the repo is fixed by the
+	// descriptor.
+	ContextRefs map[string]string `json:"context_refs,omitempty"`
 }
 
 // Descriptor mirrors the per-repo build.json checked in beside the services it
@@ -53,6 +57,9 @@ type Descriptor struct {
 	// descriptor authoring to untrusted input: these commands are arbitrary code.
 	PreBuild []string      `json:"pre_build,omitempty"`
 	Services []ServiceSpec `json:"services"`
+	// Contexts declares extra git repos exposed to every service as buildx named contexts
+	// (`COPY --from=<name>`); see contexts.go.
+	Contexts map[string]ContextSpec `json:"contexts,omitempty"`
 }
 
 type PlatformSpec struct {
@@ -90,6 +97,9 @@ func (p PlatformSpec) validate(where string, requireMode bool) error {
 // validate checks the parts of a descriptor that would otherwise fail late or build the wrong thing.
 func (d Descriptor) validate() error {
 	if err := d.Platform.validate("platform", false); err != nil {
+		return err
+	}
+	if err := validateContexts(d.Contexts); err != nil {
 		return err
 	}
 	seen := map[string]bool{}
@@ -132,6 +142,13 @@ type ServiceSpec struct {
 	// whose base is single-arch (a Chrome sidecar is amd64-only) can build for it alone while the rest
 	// of the project stays multi-arch.
 	Platform *PlatformSpec `json:"platform,omitempty"`
+	// Memory is the service's memory RESERVATION (e.g. "6g"): it is admitted only while the running
+	// services' reservations fit under the agent's BUILD_MEMORY_CEILING, and rejected if it exceeds
+	// that ceiling. Empty = the agent's default reservation. See memory.go.
+	Memory string `json:"memory,omitempty"`
+	// SkipLatest pushes only the versioned tag, leaving :latest (and the :stable rotation)
+	// untouched — for artifact images (`FROM scratch` AAB) that consumers pull by tag@digest.
+	SkipLatest bool `json:"skip_latest,omitempty"`
 }
 
 func (s ServiceSpec) dockerfile() string {
@@ -209,6 +226,7 @@ type ServiceProgress struct {
 	DurationMs int64        `json:"duration_ms,omitempty"`
 	Image      string       `json:"image,omitempty"`
 	Tag        string       `json:"tag,omitempty"`
+	Digest     string       `json:"digest,omitempty"` // sha256 of the manifest this job pushed under Tag
 	Err        string       `json:"error,omitempty"`
 	// Live docker buildx sub-step (parsed from --progress=plain `#N [stage n/m]`
 	// lines). A liveness indicator only — meaningful while State==building;
@@ -245,6 +263,11 @@ type buildPublic struct {
 	ErrorMsg    string            `json:"error,omitempty"`
 	LineCount   int               `json:"line_count"`
 	TriggerKey  string            `json:"trigger_key,omitempty"`
+	// Revision is the app commit SHA the build cloned (empty for an uploaded context); Contexts
+	// holds each named context's resolved SHA. Together with each service's Tag and Digest this is
+	// the whole provenance a consumer asserts against.
+	Revision string                   `json:"revision,omitempty"`
+	Contexts map[string]ContextResult `json:"contexts,omitempty"`
 }
 
 // Build is one build invocation tracked through its lifecycle.
@@ -405,7 +428,21 @@ func (b *Build) snapshot() buildPublic {
 		p := *b.buildPublic.Progress
 		cp.Progress = &p
 	}
+	if b.buildPublic.Contexts != nil {
+		cp.Contexts = make(map[string]ContextResult, len(b.buildPublic.Contexts))
+		for k, v := range b.buildPublic.Contexts {
+			cp.Contexts[k] = v
+		}
+	}
 	return cp
+}
+
+// setSources records the resolved commits of the build's sources (set once, after the clones).
+func (b *Build) setSources(revision string, contexts map[string]ContextResult) {
+	b.mu.Lock()
+	b.Revision = revision
+	b.Contexts = contexts
+	b.mu.Unlock()
 }
 
 func (b *Build) appendLine(line string) {

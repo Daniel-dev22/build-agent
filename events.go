@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	eventoutbox "github.com/Daniel-dev22/agent-kit-go/eventoutbox"
@@ -78,6 +79,15 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
+	}
+	// Additive migration: the resolved source commits (app SHA + named-context SHAs). A finished
+	// job is evicted from memory and re-read from this table, so a result that is not persisted
+	// loses its provenance the moment the job ages out. SQLite has no ADD COLUMN IF NOT EXISTS;
+	// a duplicate-column error just means the migration already ran.
+	if _, err := db.Exec(`ALTER TABLE builds ADD COLUMN sources BLOB`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
 	}
 
 	urlFor := func(jobID string) string {
@@ -169,40 +179,54 @@ func (e *eventBuffer) upsertBuild(snap buildPublic) {
 	if snap.Progress != nil {
 		progressJSON, _ = json.Marshal(snap.Progress)
 	}
+	sourcesJSON, _ := json.Marshal(buildSources{Revision: snap.Revision, Contexts: snap.Contexts})
 	_, err := e.db.Exec(`
 		INSERT INTO builds (id, project, ref, version_tag, registry, state, services, progress,
-			started_at_ns, completed_at_ns, exit_code, error, line_count, trigger_key, updated_at_ns)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			started_at_ns, completed_at_ns, exit_code, error, line_count, trigger_key, updated_at_ns, sources)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			project=excluded.project, ref=excluded.ref, version_tag=excluded.version_tag,
 			registry=excluded.registry, state=excluded.state, services=excluded.services,
 			progress=excluded.progress, started_at_ns=excluded.started_at_ns,
 			completed_at_ns=excluded.completed_at_ns, exit_code=excluded.exit_code,
 			error=excluded.error, line_count=excluded.line_count, trigger_key=excluded.trigger_key,
-			updated_at_ns=excluded.updated_at_ns`,
+			updated_at_ns=excluded.updated_at_ns, sources=excluded.sources`,
 		snap.ID, snap.Project, snap.Ref, snap.VersionTag, snap.Registry, string(snap.State),
 		servicesJSON, progressJSON, tsToNs(snap.StartedAt), tsToNs(snap.CompletedAt),
-		snap.ExitCode, snap.ErrorMsg, snap.LineCount, snap.TriggerKey, time.Now().UnixNano(),
+		snap.ExitCode, snap.ErrorMsg, snap.LineCount, snap.TriggerKey, time.Now().UnixNano(), sourcesJSON,
 	)
 	if err != nil {
 		slog.Warn("persist build failed", "error", err, "job", snap.ID)
 	}
 }
 
+// buildSources is the persisted form of a job's resolved source commits.
+type buildSources struct {
+	Revision string                   `json:"revision,omitempty"`
+	Contexts map[string]ContextResult `json:"contexts,omitempty"`
+}
+
 const buildSelectCols = `id, project, ref, version_tag, registry, state, services, progress,
-	started_at_ns, completed_at_ns, exit_code, error, line_count, trigger_key`
+	started_at_ns, completed_at_ns, exit_code, error, line_count, trigger_key, sources`
 
 func scanBuild(s interface{ Scan(...any) error }) (buildPublic, error) {
 	var (
 		bp                     buildPublic
 		state                  string
 		services, progress     []byte
+		sources                []byte // NULL for rows written before the column existed
 		startedNs, completedNs int64
 	)
 	if err := s.Scan(&bp.ID, &bp.Project, &bp.Ref, &bp.VersionTag, &bp.Registry, &state,
 		&services, &progress, &startedNs, &completedNs, &bp.ExitCode, &bp.ErrorMsg,
-		&bp.LineCount, &bp.TriggerKey); err != nil {
+		&bp.LineCount, &bp.TriggerKey, &sources); err != nil {
 		return buildPublic{}, err
+	}
+	if len(sources) > 0 {
+		var bs buildSources
+		if json.Unmarshal(sources, &bs) == nil {
+			bp.Revision, bp.Contexts = bs.Revision, bs.Contexts
+		}
 	}
 	bp.State = BuildState(state)
 	bp.StartedAt = nsToTime(startedNs)

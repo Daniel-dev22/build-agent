@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -69,10 +70,22 @@ type engine struct {
 	// scoped to run() cannot see this hop, so one wrong argument here ships every
 	// image label-free with the whole suite green. nil means the real docker exec.
 	execBuildx func(ctx context.Context, b *Build, svc ServiceSpec, args []string, dir string, onLine func(string)) error
+
+	// docker runs `docker <args>` and returns its output; nil means the real binary. A test seam
+	// for the builder create/inspect/cap logic, which would otherwise need a docker daemon.
+	docker func(ctx context.Context, args ...string) (string, error)
+
+	// sched holds the agent-wide lane and memory limits. One per engine, so one per agent: it is
+	// what makes a lane limit bind ACROSS concurrent jobs rather than within each.
+	sched *scheduler
+
+	builderMu sync.Mutex // serializes ensureBuilder's inspect-then-create
+	ensured   atomic.Int32 // jobs past ensureBuilder and not yet finished
+	recreated bool       // CC_RECREATE_BUILDER already honoured (guarded by builderMu)
 }
 
 func newEngine(cfg Config, cc *http.Client) *engine {
-	return &engine{cfg: cfg, cc: cc, reg: newRegistryClient()}
+	return &engine{cfg: cfg, cc: cc, reg: newRegistryClient(), sched: newScheduler(cfg)}
 }
 
 func nativePlatform() string {
@@ -126,20 +139,6 @@ func renderBuildArgs(d Descriptor, svc ServiceSpec, versionTag, apkBust string) 
 	return out
 }
 
-// gitClone clones repo@ref (shallow) into dir. For private repos a vended GitHub
-// App token is injected into the URL; the token never lands on disk in the clone.
-func (e *engine) gitClone(ctx context.Context, b *Build, repo, ref, dir, token string) error {
-	url := repo
-	if token != "" {
-		url = githubTokenURL(repo, token)
-	}
-	cctx, cancel := context.WithTimeout(ctx, e.cfg.GitTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", cloneArgs(url, ref, dir)...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	return e.stream(b, "git", cmd, nil)
-}
-
 // cloneArgs builds the `git clone` argv. Pure so the end-of-options separator is
 // testable: "--" means a repo URL or directory beginning with "-" can never be
 // read as an option (git would otherwise treat it as one, and an "ext::" URL as a
@@ -154,52 +153,93 @@ func cloneArgs(url, ref, dir string) []string {
 	return append(args, "--", url, dir)
 }
 
-// ensureBuilder reuses the persistent buildx builder (cache mounts survive); only
-// (re)creates it when missing or when CC_RECREATE_BUILDER=1.
+// ensureBuilder reuses the persistent buildx builder (cache mounts survive) and (re)creates it
+// only when missing, when it does not carry the memory cap, or once per agent lifetime when
+// CC_RECREATE_BUILDER=1.
+//
+// Serialized: concurrent jobs would otherwise race inspect-then-create on the one builder. The cap
+// is judged on the builder CONTAINER, not the buildx store (memory.go): after a redeploy the store
+// is empty while the uncapped container survives, and buildx create over it silently drops the
+// limits. An uncapped container is repaired in place (container removed, state volume kept) when no
+// service is running; the cap is ALWAYS re-verified after a create, and the job fails loudly only
+// if the repair itself did not produce a capped builder.
 func (e *engine) ensureBuilder(ctx context.Context, b *Build) error {
+	e.builderMu.Lock()
+	defer e.builderMu.Unlock()
 	name := e.cfg.Builder
-	if exec.CommandContext(ctx, "docker", "buildx", "inspect", name).Run() == nil &&
-		os.Getenv("CC_RECREATE_BUILDER") != "1" {
+	_, inspectErr := e.dockerRun(ctx, "buildx", "inspect", name)
+	storeOK := inspectErr == nil
+	exists, capped := storeOK, true // no ceiling: the store alone decides, as before
+	if e.cfg.MemoryCeiling > 0 {
+		var err error
+		if exists, capped, err = e.containerState(ctx); err != nil {
+			return fmt.Errorf("inspect builder: %w", err)
+		}
+	}
+	capOK := e.cfg.MemoryCeiling <= 0 || capped
+	recreate := os.Getenv("CC_RECREATE_BUILDER") == "1" && !e.recreated
+	if storeOK && exists && capOK && !recreate {
 		b.appendLine("[builder] reusing " + name)
 		return nil
 	}
-	_ = exec.CommandContext(ctx, "docker", "buildx", "rm", name, "--force").Run()
-	create := []string{"buildx", "create", "--name", name,
-		"--driver", "docker-container", "--driver-opt", "network=host", "--bootstrap"}
-	if e.cfg.BuildkitdConfig != "" {
-		if _, err := os.Stat(e.cfg.BuildkitdConfig); err == nil {
-			create = append(create, "--buildkitd-config", e.cfg.BuildkitdConfig)
+	if recreate {
+		// Explicit operator request, honoured once per agent lifetime (it used to fire on every job
+		// while set, deleting the cache volume each time). Clean builder, state included.
+		if e.builderBusy() {
+			return fmt.Errorf("CC_RECREATE_BUILDER requested but builds are running; it is honoured by the next job once idle")
+		}
+		e.recreated = true
+		if err := e.recreateClean(ctx); err != nil {
+			return err
+		}
+	} else if exists && !capOK {
+		if e.builderBusy() {
+			return fmt.Errorf("builder %s does not carry BUILD_MEMORY_CEILING (%d bytes) and builds are running; it is repaired by the next job once idle", name, e.cfg.MemoryCeiling)
+		}
+		b.appendLine("[builder] repairing: container lacks the memory cap, recreating it (state volume kept)")
+		if err := e.repairBuilder(ctx); err != nil {
+			return err
+		}
+	} else if storeOK && !exists {
+		_, _ = e.dockerRun(ctx, "buildx", "rm", "--keep-state", name) // stale store entry, container gone
+	}
+	out, err := e.dockerRun(ctx, builderCreateArgs(e.cfg)...)
+	for _, l := range strings.Split(out, "\n") {
+		if l != "" {
+			b.appendLine("[builder] " + l)
 		}
 	}
-	if err := e.stream(b, "builder", exec.CommandContext(ctx, "docker", create...), nil); err != nil {
+	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
+	}
+	if e.cfg.MemoryCeiling > 0 {
+		_, capped, err := e.containerState(ctx)
+		if err != nil || !capped {
+			return fmt.Errorf("builder %s was created but does not carry BUILD_MEMORY_CEILING (%d bytes): %v", name, e.cfg.MemoryCeiling, err)
+		}
 	}
 	b.appendLine("[builder] created " + name)
 	return nil
 }
 
-func (e *engine) rotateTags(ctx context.Context, full string) {
-	if exec.CommandContext(ctx, "docker", "buildx", "imagetools", "inspect", full+":latest").Run() == nil {
-		_ = exec.CommandContext(ctx, "docker", "buildx", "imagetools", "create",
-			"--tag", full+":stable", full+":latest").Run()
-	}
+// builderBusy reports whether anything could be using the builder: a service inside buildx, or a job
+// that already passed ensureBuilder and has not finished (it may be about to be admitted). Repairs
+// and recreates are only done when neither holds, which closes the repair-versus-admission race.
+func (e *engine) builderBusy() bool {
+	return (e.sched != nil && e.sched.running.Load() > 0) || e.ensured.Load() > 0
 }
 
-func (e *engine) tagVersioned(ctx context.Context, full, tag string) error {
-	out, err := exec.CommandContext(ctx, "docker", "buildx", "imagetools", "create",
-		"--tag", full+":"+tag, full+":latest").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("versioned tag %s: %v: %s", tag, err, strings.TrimSpace(string(out)))
+func (e *engine) rotateTags(ctx context.Context, full string) {
+	if _, err := e.dockerRun(ctx, "buildx", "imagetools", "inspect", full+":latest"); err == nil {
+		_, _ = e.dockerRun(ctx, "buildx", "imagetools", "create", "--tag", full+":stable", full+":latest")
 	}
-	return nil
 }
 
 func (e *engine) boundedGC(ctx context.Context) {
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, "docker", "buildx", "prune", "--builder", e.cfg.Builder, "--force",
+	out, err := e.dockerRun(ctx, "buildx", "prune", "--builder", e.cfg.Builder, "--force",
 		"--reserved-space", "10GB", "--max-used-space", "40GB", "--min-free-space", "20GB",
 		"--filter", "until=168h")
-	out, err := cmd.CombinedOutput()
 	// Always log the duration. This step cost one build 155.7 seconds while
 	// emitting nothing at all, so its only trace was a gap between two timestamps
 	// in a table nobody reads. A prune that starts taking minutes should be
@@ -214,17 +254,21 @@ func (e *engine) boundedGC(ctx context.Context) {
 // buildService runs one service through buildx + tagging + retention. token is
 // passed as a buildx secret (id=ghtoken) so the Dockerfile can `go mod download`
 // private modules. Returns the resulting image repo path on success.
-func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc ServiceSpec, registry, versionTag, apkBust, secretFile string, prov provenance, tagRotation bool, retentionKeep int, notify func()) (string, error) {
+func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc ServiceSpec, registry, versionTag, apkBust, secretFile string, prov provenance, tagRotation bool, retentionKeep int, notify func(), bx buildExtras) (serviceResult, error) {
 	image := d.ImagePrefix + svc.Name
 	full := registry + "/" + image
 	dockerfile := svc.dockerfile()
 	if _, err := os.Stat(filepath.Join(b.workdir(), dockerfile)); err != nil {
-		return "", fmt.Errorf("dockerfile %s not found", dockerfile)
+		return serviceResult{}, fmt.Errorf("dockerfile %s not found", dockerfile)
 	}
-	if tagRotation {
+	// :stable is the previous :latest. With :latest skipped there is nothing to rotate.
+	if tagRotation && !svc.SkipLatest {
 		e.rotateTags(ctx, full)
 	}
-	args := buildxArgs(e.cfg.Builder, d, svc, full, dockerfile, versionTag, apkBust, secretFile, prov)
+	// buildx writes the pushed manifest digest here. It sits in the job root, beside the context,
+	// so it is never shipped to BuildKit and is removed with the job.
+	bx.metadataFile = filepath.Join(b.jobRoot(), "meta-"+svc.Name+".json")
+	args := buildxArgs(e.cfg.Builder, d, svc, full, dockerfile, versionTag, apkBust, secretFile, prov, bx)
 
 	// Parse buildx stage-step lines off the same stream and surface them as a
 	// live indicator. Only a real step change broadcasts (setServiceStep dedupes),
@@ -241,13 +285,23 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 		run = e.execBuildxDocker
 	}
 	if err := run(ctx, b, svc, args, b.workdir(), onLine); err != nil {
-		return "", err
+		return serviceResult{}, err
 	}
-	if err := e.tagVersioned(ctx, full, versionTag); err != nil {
-		return "", err
+	// The versioned tag was pushed by the build itself (see buildxArgs), so it cannot point at
+	// another job's :latest. The digest names exactly what this job pushed; consumers pull by
+	// tag@digest, never :latest.
+	digest, err := readPushedDigest(bx.metadataFile)
+	if err != nil {
+		return serviceResult{}, fmt.Errorf("image pushed as %s:%s but its digest is unavailable: %w", full, versionTag, err)
 	}
 	e.reg.pruneOldTags(ctx, registry, image, retentionKeep)
-	return image, nil
+	return serviceResult{Image: image, Digest: digest}, nil
+}
+
+// serviceResult is what a finished service reports back to the job.
+type serviceResult struct {
+	Image  string // image repo path under the registry
+	Digest string // sha256:... of the pushed manifest (index when multi-platform)
 }
 
 // execBuildxDocker is the production implementation of the execBuildx seam.
@@ -261,7 +315,7 @@ func (e *engine) execBuildxDocker(ctx context.Context, b *Build, svc ServiceSpec
 // service. Pure (no exec) so the arg ordering — platform, cache, build-args,
 // optional --target, optional ghtoken secret, the provenance labels, and the
 // trailing -t/-f/--push context — is unit-testable.
-func buildxArgs(builder string, d Descriptor, svc ServiceSpec, full, dockerfile, versionTag, apkBust, secretFile string, prov provenance) []string {
+func buildxArgs(builder string, d Descriptor, svc ServiceSpec, full, dockerfile, versionTag, apkBust, secretFile string, prov provenance, bx buildExtras) []string {
 	args := []string{"buildx", "build", "--builder", builder, "--progress=plain"}
 	args = append(args, platformArgs(d, svc)...)
 	args = append(args,
@@ -278,7 +332,15 @@ func buildxArgs(builder string, d Descriptor, svc ServiceSpec, full, dockerfile,
 	// the LLB the solver keys its cache on — a build whose only change is a label
 	// still hits the registry buildcache.
 	args = append(args, prov.labelArgs()...)
-	args = append(args, "-t", full+":latest", "-f", dockerfile, "--push", svc.buildContext())
+	args = append(args, bx.args()...)
+	// Both tags are pushed by this one build. The versioned tag used to be copied from :latest
+	// afterwards (imagetools create), which let a concurrent job on the same image re-point it at
+	// ITS digest. skip_latest leaves :latest (and the :stable rotation) untouched, for artifact
+	// images such as a `FROM scratch` AAB that nothing should run or pull as "latest".
+	if !svc.SkipLatest {
+		args = append(args, "-t", full+":latest")
+	}
+	args = append(args, "-t", full+":"+versionTag, "-f", dockerfile, "--push", svc.buildContext())
 	return args
 }
 
@@ -332,18 +394,6 @@ func (e *engine) stream(b *Build, prefix string, cmd *exec.Cmd, onLine func(stri
 	return werr
 }
 
-func (e *engine) laneSem(d Descriptor) (fast, slow chan struct{}) {
-	fn := d.Lanes.Fast
-	if fn <= 0 {
-		fn = e.cfg.FastLane
-	}
-	sn := d.Lanes.Slow
-	if sn <= 0 {
-		sn = e.cfg.SlowLane
-	}
-	return make(chan struct{}, fn), make(chan struct{}, sn)
-}
-
 // run orchestrates a whole build invocation, mutating b and notifying via
 // onChange on every lifecycle transition. notify is a lightweight fleet-only
 // nudge (no controller event) used for live sub-step broadcasts. Blocks until
@@ -380,29 +430,37 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 	// only part that cannot be known yet — it needs the clone to exist.
 	prov := provenanceFor(req)
 
-	var secretFile string
-	if req.ContextB64 != "" {
-		if err := extractContextTarGz(req.ContextB64, dir); err != nil {
-			fail("extract context: " + err.Error())
+	// Setup phases (vend, clones, builder, pre_build, cache check) run under their own deadline.
+	// Admission below has none, and BUILD_TIMEOUT starts per service at admission, so a hung setup
+	// step fails ITS job and releases builderMu instead of wedging every later job.
+	jobCtx := ctx
+	if e.cfg.SetupTimeout > 0 {
+		var cancelSetup context.CancelFunc
+		ctx, cancelSetup = context.WithTimeout(ctx, e.cfg.SetupTimeout)
+		defer cancelSetup()
+	}
+
+	// One token covers the app repo and every named-context repo that is private: it is vended once,
+	// authenticates each clone through the environment (gitclone.go), and is handed to buildx only as
+	// the id=ghtoken secret. It is never a URL, a context file or a build arg.
+	var secretFile, cloneToken string
+	if slugs := tokenRepos(req, d, e.cfg.PrivateRepoOwners); len(slugs) > 0 {
+		tok, err := vendGitHubToken(ctx, e.cc, e.cfg.ControlCenterURL, slugs)
+		if err != nil {
+			fail("github token vend: " + err.Error())
 			return
 		}
-	} else {
-		// Private repos vend a short-lived GitHub App installation token from the
-		// controller; it is used for the clone URL and as a buildx secret for
-		// `go mod download` of private modules. Never written into the clone.
-		var cloneToken string
-		if isPrivate(req, e.cfg.PrivateRepoOwners) {
-			tok, err := vendGitHubToken(ctx, e.cc, e.cfg.ControlCenterURL, []string{repoSlug(req.Repo)})
-			if err != nil {
-				fail("github token vend: " + err.Error())
-				return
-			}
-			cloneToken = tok.Token
-			// Inside the job root so the deferred RemoveAll above always covers it:
-			// a path outside it would survive a kill between this write and the
-			// os.Remove below, leaving a live token on disk under WORK_DIR. It sits
-			// beside — not inside — the context dir, so buildkit never receives it
-			// as context; the Dockerfile gets it only via --secret id=ghtoken.
+		cloneToken = tok.Token
+		// Inside the job root so the deferred RemoveAll above always covers it:
+		// a path outside it would survive a kill between this write and the
+		// os.Remove below, leaving a live token on disk under WORK_DIR. It sits
+		// beside — not inside — the context dir, so buildkit never receives it
+		// as context; the Dockerfile gets it only via --secret id=ghtoken.
+		//
+		// The Dockerfile is handed the secret only when the APP repo itself is private and cloned by
+		// the agent: a private named context must not widen an uploaded-tarball Dockerfile's reach to
+		// the installation-wide token (it is only ever used here, for the context clone).
+		if req.ContextB64 == "" && isPrivate(req, e.cfg.PrivateRepoOwners) {
 			secretFile = filepath.Join(b.jobRoot(), ".ghtoken")
 			if err := os.WriteFile(secretFile, []byte(tok.Token), 0o600); err != nil {
 				fail("write token secret: " + err.Error())
@@ -410,16 +468,35 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			}
 			defer os.Remove(secretFile)
 		}
-		if err := e.gitClone(ctx, b, req.Repo, req.Ref, dir, cloneToken); err != nil {
+	}
+	if req.ContextB64 != "" {
+		if err := extractContextTarGz(req.ContextB64, dir); err != nil {
+			fail("extract context: " + err.Error())
+			return
+		}
+	} else {
+		appToken := ""
+		if isPrivate(req, e.cfg.PrivateRepoOwners) {
+			appToken = cloneToken
+		}
+		if err := e.gitClone(ctx, b, req.Repo, req.Ref, dir, appToken); err != nil {
 			fail("git clone: " + err.Error())
 			return
 		}
 		prov.Revision = e.gitRevision(ctx, b, dir)
 	}
+	namedCtxs, ctxResults, err := e.cloneContexts(ctx, b, d, req, cloneToken)
+	if err != nil {
+		fail(err.Error())
+		return
+	}
+	b.setSources(prov.Revision, ctxResults)
 	if err := e.ensureBuilder(ctx, b); err != nil {
 		fail(err.Error())
 		return
 	}
+	e.ensured.Add(1) // from here this job may be admitted at any moment: no repair of the builder
+	defer e.ensured.Add(-1)
 
 	// Project pre-build hook: run the descriptor's PreBuild commands in the freshly
 	// populated workdir before any service builds — e.g. a `make version` step that
@@ -435,9 +512,11 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 	// the context (a `make version` stamp, a web/.env), and those are created on
 	// the same storage — so a normalisation that ran only after the clone would
 	// miss them. See context_modes.go for why the on-disk modes matter at all.
-	if err := normalizeContextModes(dir); err != nil {
-		fail("normalize context modes: " + err.Error())
-		return
+	for _, cdir := range append([]string{dir}, contextDirs(namedCtxs)...) {
+		if err := normalizeContextModes(cdir); err != nil {
+			fail("normalize context modes: " + err.Error())
+			return
+		}
 	}
 
 	// Best-effort registry buildcache validation/bust before building.
@@ -455,18 +534,24 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 		retentionKeep = *d.RetentionKeep
 	}
 
-	fast, slow := e.laneSem(d)
+	ctx = jobCtx // setup is over: back to the job context (no deadline) for admission and builds
+	limits := e.sched.limitsFor(d)
 	var wg sync.WaitGroup
 	for _, svc := range services {
 		wg.Add(1)
 		go func(svc ServiceSpec) {
 			defer wg.Done()
-			sem := fast
-			if svc.lane() == "slow" {
-				sem = slow
+			// Agent-wide admission (lane slot + memory reservation); blocks while other jobs hold them.
+			releaseSlot, aerr := e.sched.admit(ctx, limits, svc)
+			if aerr != nil {
+				b.setServiceState(svc.Name, SvcFailed, func(sp *ServiceProgress) { sp.Err = "admission: " + aerr.Error() })
+				onChange(EventProgress)
+				return
 			}
-			sem <- struct{}{}
-			defer func() { <-sem }()
+			defer releaseSlot()
+			// The build deadline starts here, at admission, not when the job was accepted.
+			bctx, bcancel := e.buildDeadline(ctx)
+			defer bcancel()
 
 			b.setServiceState(svc.Name, SvcBuilding, func(sp *ServiceProgress) {
 				now := time.Now().UTC()
@@ -475,7 +560,7 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			})
 			onChange(EventProgress)
 
-			image, err := e.buildService(ctx, b, d, svc, registry, versionTag, apkBust, secretFile, prov, tagRotation, retentionKeep, notify)
+			res, err := e.buildService(bctx, b, d, svc, registry, versionTag, apkBust, secretFile, prov, tagRotation, retentionKeep, notify, buildExtras{contexts: namedCtxs})
 			finish := func(sp *ServiceProgress) {
 				now := time.Now().UTC()
 				sp.EndedAt = &now
@@ -489,7 +574,7 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			if err != nil {
 				b.setServiceState(svc.Name, SvcFailed, func(sp *ServiceProgress) { finish(sp); sp.Err = err.Error() })
 			} else {
-				b.setServiceState(svc.Name, SvcDone, func(sp *ServiceProgress) { finish(sp); sp.Image = image; sp.Tag = versionTag })
+				b.setServiceState(svc.Name, SvcDone, func(sp *ServiceProgress) { finish(sp); sp.Image = res.Image; sp.Tag = versionTag; sp.Digest = res.Digest })
 			}
 			onChange(EventProgress)
 		}(svc)
@@ -565,18 +650,7 @@ func selectServices(d Descriptor, want []string) []ServiceSpec {
 // the repo is inferred private when its URL names one of the configured owners
 // (PRIVATE_REPO_OWNERS). An empty owner list means nothing is inferred private.
 func isPrivate(req BuildRequest, owners []string) bool {
-	if req.Private != nil {
-		return *req.Private
-	}
-	for _, o := range owners {
-		if o == "" {
-			continue
-		}
-		if strings.Contains(req.Repo, o+"/") {
-			return true
-		}
-	}
-	return false
+	return isPrivateRepo(req.Repo, req.Private, owners)
 }
 
 // repoSlug extracts "owner/repo" from an ssh or https git URL
@@ -590,9 +664,4 @@ func repoSlug(repo string) string {
 		return s[i+len("github.com/"):]
 	}
 	return s
-}
-
-// githubTokenURL rewrites a repo URL to the token-bearing https clone form.
-func githubTokenURL(repo, token string) string {
-	return "https://x-access-token:" + token + "@github.com/" + repoSlug(repo) + ".git"
 }
