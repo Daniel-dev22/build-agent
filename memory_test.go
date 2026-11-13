@@ -356,6 +356,7 @@ type oomHost struct {
 	oomState  string // reply to the OOMKilled inspect
 	runc      bool   // a RUN step is alive
 	starts    int
+	oomEvent  bool // docker recorded an oom event for the container
 }
 
 func (o *oomHost) fn(_ context.Context, args ...string) (string, error) {
@@ -377,6 +378,11 @@ func (o *oomHost) fn(_ context.Context, args ...string) (string, error) {
 			max = strconv.FormatInt(slotCap, 10)
 		}
 		return fmt.Sprintf("%s\nlow 0\nhigh 0\nmax 5\noom 1\noom_kill %d\noom_group_kill 0", max, o.kills), nil
+	case "events":
+		if o.oomEvent {
+			return "2026-11-13T10:07:00 container oom buildx_buildkit_b0", nil
+		}
+		return "", nil
 	case "start":
 		o.starts++
 		o.running, o.execOK = true, true
@@ -436,8 +442,49 @@ func TestRestartedBuilderDuringABuildIsReportedAsOOM(t *testing.T) {
 	if !oom || !restarted {
 		t.Fatalf("a builder restarted mid-build must read as OOM-suspect: oom=%v restarted=%v", oom, restarted)
 	}
-	if err := e.oomError(errors.New("x"), true); !strings.Contains(err.Error(), "restarted") {
+	if err := e.oomError(errors.New("x"), true, true); !strings.Contains(err.Error(), "out of memory") || !strings.Contains(err.Error(), "restarted") {
 		t.Fatalf("%v", err)
+	}
+}
+
+// N2: a restart is only called out-of-memory when docker also recorded an oom event; otherwise it is
+// reported as a restart that is possibly OOM, so a buildkitd panic is not misdiagnosed.
+func TestRestartWithoutAnOOMEventIsNotClaimedAsOOM(t *testing.T) {
+	for _, tc := range []struct {
+		event bool
+		want  string
+		not   string
+	}{{true, "out of memory", "possibly"}, {false, "possibly out of memory", "exceeded"}} {
+		o := newOOMHost()
+		o.oomEvent = tc.event
+		e := oomEngine(o)
+		before := e.probeSlot(context.Background(), "b")
+		confirmed := e.oomSeen(context.Background(), "b", before.startedAt)
+		err := e.oomError(errors.New("x"), true, confirmed).Error()
+		if !strings.Contains(err, tc.want) || strings.Contains(err, tc.not) {
+			t.Errorf("event=%v: %s", tc.event, err)
+		}
+	}
+}
+
+// N4: memory.max is page-aligned, so the configured cap is rounded down to a MiB to read back equal.
+func TestSlotMemoryIsAlignedToAMiB(t *testing.T) {
+	if alignMiB(262145<<10) != 256<<20 || alignMiB(4<<30) != 4<<30 || alignMiB(1000) != 0 {
+		t.Fatal("alignMiB must round down to whole MiB")
+	}
+}
+
+// N3: when the container cannot be asked what is running, the hold-until-idle protection says so once.
+func TestWaitIdleWarnsOncePerSlotWhenItCannotAsk(t *testing.T) {
+	o := newOOMHost()
+	o.execOK = false
+	e := oomEngine(o)
+	b := newJob(t)
+	for i := 0; i < 3; i++ {
+		e.waitIdle(context.Background(), b, slot0(e), time.Second)
+	}
+	if n := strings.Count(strings.Join(b.logLines(), "\n"), "cannot list processes"); n != 1 {
+		t.Fatalf("warned %d times, want once", n)
 	}
 }
 
@@ -481,7 +528,7 @@ func TestForeignCgroupCountersAreNotTrusted(t *testing.T) {
 func TestOOMErrorNamesTheLimitAndKeepsTheCause(t *testing.T) {
 	e := oomEngine(newOOMHost())
 	cause := errors.New("exit status 1")
-	err := e.oomError(cause, false)
+	err := e.oomError(cause, false, false)
 	if !strings.Contains(err.Error(), "out of memory") || !strings.Contains(err.Error(), "4096MiB") || !errors.Is(err, cause) {
 		t.Fatalf("%v", err)
 	}
@@ -499,7 +546,7 @@ func TestWaitIdleHoldsUntilNoStepIsRunningAndIsBounded(t *testing.T) {
 		o.mu.Unlock()
 	}()
 	start := time.Now()
-	e.waitIdle(context.Background(), "b", 5*time.Second)
+	e.waitIdle(context.Background(), newJob(t), slot0(e), 5*time.Second)
 	if d := time.Since(start); d < 250*time.Millisecond || d > 3*time.Second {
 		t.Fatalf("waited %v for a step that ended at 300ms", d)
 	}
@@ -507,7 +554,7 @@ func TestWaitIdleHoldsUntilNoStepIsRunningAndIsBounded(t *testing.T) {
 	o.runc = true
 	o.mu.Unlock()
 	start = time.Now()
-	e.waitIdle(context.Background(), "b", 400*time.Millisecond)
+	e.waitIdle(context.Background(), newJob(t), slot0(e), 400*time.Millisecond)
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("waitIdle must give up at its limit")
 	}
@@ -528,7 +575,7 @@ func TestBuildServiceReportsOOMOnlyWhenTheSlotCgroupKilled(t *testing.T) {
 				o.kills++
 			}
 			if restart {
-				o.kills, o.startedAt = 0, "2026-11-13T11:00:00Z"
+				o.kills, o.startedAt, o.oomEvent = 0, "2026-11-13T11:00:00Z", true
 			}
 			o.mu.Unlock()
 			if cancel {
@@ -585,24 +632,46 @@ func TestBoundedGCPrunesEveryExistingFreeSlotWithSplitBounds(t *testing.T) {
 	}
 	existing["buildx_buildkit_b-s10"] = true
 	prunes = nil
-	_, rel, _ := e.sched.slots.tryAcquireIdx(0) // a build holds slot 0
-	e.boundedGC(context.Background())
-	if len(prunes) != 1 || !strings.Contains(prunes[0], "--builder b-s1 ") {
-		t.Fatalf("a held slot must be skipped: %v", prunes)
-	}
-	rel()
-	prunes = nil
+	_, rel, _ := e.sched.slots.acquire(context.Background()) // a build holds slot 0
 	e.boundedGC(context.Background())
 	if len(prunes) != 2 {
-		t.Fatalf("every existing free slot: %v", prunes)
+		t.Fatalf("GC must not depend on (or take) the build slot: %v", prunes)
 	}
+	rel()
 	for _, p := range prunes {
 		if !strings.Contains(p, "--max-used-space "+strconv.FormatInt(20<<30, 10)) || !strings.Contains(p, "--reserved-space "+strconv.FormatInt(5<<30, 10)) {
 			t.Fatalf("the 40GB/10GB totals must be split across 2 slots: %s", p)
 		}
 	}
-	if _, _, ok := e.sched.slots.tryAcquireIdx(0); !ok {
-		t.Fatal("GC must release the slot it took")
+}
+
+// N1: the prune excludes only create/repair/recreate. A build reusing a healthy builder never waits
+// for a running prune; one that must repair does, and proceeds the moment the prune ends.
+func TestPruneBlocksOnlyBuilderMutationsNeverTheReusePath(t *testing.T) {
+	h := &fakeHost{storeOK: true, exists: true, mem: slotCap, swap: slotCap}
+	e := hostEngine(h)
+	bld := slot0(e)
+	bld.maint.Lock() // a prune is running on slot 0
+	done := make(chan error, 1)
+	go func() { done <- e.ensureBuilder(context.Background(), newJob(t), bld) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the reuse fast path waited for a prune")
+	}
+	h.mem, h.swap = 8<<30, 8<<30 // old pool-sized cap: needs a repair
+	go func() { done <- e.ensureBuilder(context.Background(), newJob(t), bld) }()
+	select {
+	case <-done:
+		t.Fatal("a repair must wait for the prune")
+	case <-time.After(150 * time.Millisecond):
+	}
+	bld.maint.Unlock()
+	if err := <-done; err != nil || h.mem != slotCap {
+		t.Fatalf("repair after the prune: err=%v mem=%d", err, h.mem)
 	}
 }
 

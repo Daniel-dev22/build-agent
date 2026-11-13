@@ -32,7 +32,7 @@ type Config struct {
 	Builder              string        // persistent buildx builder name (default "build-agent-builder")
 	BuildkitdConfig      string        // optional path to buildkitd.toml (GC bounds); "" = none
 	FastLane             int           // concurrent fast-lane (Go) service builds
-	SlowLane             int           // concurrent slow-lane (frontend) service builds
+	SlowLane             int           // concurrent slow-lane (Android) service builds; frontend builds are fast-lane
 	RetentionKeepDefault int           // default retention when a descriptor omits it
 	GitTimeout           time.Duration // per-clone timeout
 	BuildTimeout         time.Duration // hard ceiling per build job
@@ -93,6 +93,7 @@ func loadConfig() Config {
 	if cfg.SlotMemory == 0 {
 		cfg.SlotMemory = cfg.MemoryCeiling
 	}
+	cfg.SlotMemory = alignMiB(cfg.SlotMemory) // memory.max is page-aligned: keep the cap readable back exactly
 	if err := cfg.validateMemory(); err != nil {
 		slog.Error("invalid memory configuration", "error", err)
 		os.Exit(1)

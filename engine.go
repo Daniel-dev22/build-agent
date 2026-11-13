@@ -167,6 +167,9 @@ func (e *engine) ensureBuilder(ctx context.Context, b *Build, bld *builder) erro
 		b.appendLine("[builder] reusing " + name)
 		return nil
 	}
+	// Only the mutating branches below exclude the GC prune; the reuse fast path above never waits.
+	bld.maint.Lock()
+	defer bld.maint.Unlock()
 	switch {
 	case recreate:
 		// Explicit operator request, honoured once per slot per agent lifetime. Clean builder, state
@@ -206,27 +209,26 @@ func (e *engine) rotateTags(ctx context.Context, full string) {
 }
 
 // boundedGC prunes every slot builder that exists on the daemon (derived from docker, not from what
-// this process happened to use, so a slot last used before a restart is still bounded). Each slot is
-// taken through the pool first, so a prune never overlaps a build's create/repair on it; a slot a
-// build holds is skipped and pruned by the next GC. The size bounds are per builder, so the
+// this process happened to use, so a slot last used before a restart is still bounded). It does NOT
+// take the build slot: BuildKit prunes only records no running solve uses (the base agent ran it
+// alongside the next build), so holding a slot for a prune that can take minutes would put it back on
+// the next build's critical path. The only hazard is a container create/repair/recreate overlapping
+// the prune, which the per-builder maintenance mutex excludes. The size bounds are per builder, so the
 // agent-wide totals (10GB reserved, 40GB max used) are split across the slots; min-free-space is a
 // host-disk floor and stays whole.
 func (e *engine) boundedGC(ctx context.Context) {
 	n := int64(max(len(e.sched.slots.builders), 1))
 	reserved, maxUsed := strconv.FormatInt(10<<30/n, 10), strconv.FormatInt(40<<30/n, 10)
-	for i, bld := range e.sched.slots.builders {
+	for _, bld := range e.sched.slots.builders {
 		if exists, _, err := e.containerState(ctx, bld.name); err != nil || !exists {
 			continue
 		}
-		_, free, ok := e.sched.slots.tryAcquireIdx(i)
-		if !ok {
-			continue
-		}
 		start := time.Now()
+		bld.maint.Lock()
 		out, err := e.dockerRun(ctx, "buildx", "prune", "--builder", bld.name, "--force",
 			"--reserved-space", reserved, "--max-used-space", maxUsed, "--min-free-space", "20GB",
 			"--filter", "until=168h")
-		free()
+		bld.maint.Unlock()
 		// Always log the duration. This step cost one build 155.7 seconds while
 		// emitting nothing at all, so its only trace was a gap between two timestamps
 		// in a table nobody reads. A prune that starts taking minutes should be
@@ -285,11 +287,12 @@ func (e *engine) buildService(ctx context.Context, b *Build, bld *builder, d Des
 		defer cancel()
 		if ctx.Err() == nil {
 			if oom, restarted := e.buildOOMKilled(qctx, bld.name, before, started); oom {
-				return serviceResult{}, e.oomError(err, restarted)
+				confirmed := restarted && e.oomSeen(qctx, bld.name, before.startedAt)
+				return serviceResult{}, e.oomError(err, restarted, confirmed)
 			}
 		}
 		// buildkitd tears a failed or cancelled solve down asynchronously: keep the slot until it has.
-		e.waitIdle(qctx, bld.name, 20*time.Second)
+		e.waitIdle(qctx, b, bld, 20*time.Second)
 		return serviceResult{}, err
 	}
 	// The versioned tag was pushed by the build itself (see buildxArgs), so it cannot point at

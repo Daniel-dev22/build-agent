@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -113,10 +114,18 @@ func (d Descriptor) checkMemory(slot int64) error {
 // builder is one slot's BuildKit builder. Only the holder of the slot touches the mutable fields, so
 // they need no lock.
 type builder struct {
-	idx       int
-	name      string // buildx builder name
-	recreated bool   // CC_RECREATE_BUILDER already honoured for this slot
+	idx        int
+	name       string // buildx builder name
+	recreated  bool   // CC_RECREATE_BUILDER already honoured for this slot
+	idleWarned bool   // stepsRunning could not ask this slot; said so once
+	// maint serialises the operations that MUTATE the builder container (create / repair / recreate)
+	// against the GC prune. A build never takes it on the reuse fast path, and the prune does not take
+	// the slot, so neither ever waits for the other unless a repair actually coincides with a prune.
+	maint sync.Mutex
 }
+
+// alignMiB rounds n down to a whole MiB.
+func alignMiB(n int64) int64 { return n &^ (1<<20 - 1) }
 
 func slotBuilderName(base string, idx int) string {
 	if idx == 0 {
@@ -353,11 +362,16 @@ func (e *engine) stepsRunning(ctx context.Context, name string) (running, ok boo
 // waitIdle holds the slot until buildkitd has torn down the solve that just ended (a cancelled or
 // failed buildx client returns before the daemon is done), so the next holder never shares the cgroup
 // with a dying RUN step. Bounded; it gives up silently after the limit.
-func (e *engine) waitIdle(ctx context.Context, name string, limit time.Duration) {
+func (e *engine) waitIdle(ctx context.Context, b *Build, bld *builder, limit time.Duration) {
 	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	for {
-		if running, ok := e.stepsRunning(ctx, name); !ok || !running {
+		running, ok := e.stepsRunning(ctx, bld.name)
+		if !ok && !bld.idleWarned {
+			bld.idleWarned = true // slot holder only: no lock needed
+			b.appendLine("[builder] warning: cannot list processes in " + bld.name + "; not waiting for a cancelled solve to finish")
+		}
+		if !ok || !running {
 			return
 		}
 		select {
@@ -368,11 +382,24 @@ func (e *engine) waitIdle(ctx context.Context, name string, limit time.Duration)
 	}
 }
 
-// oomError is the failure a build gets when its slot's cgroup killed it.
-func (e *engine) oomError(cause error, restarted bool) error {
+// oomSeen asks docker whether it recorded an oom event for the slot container since the given time.
+func (e *engine) oomSeen(ctx context.Context, name, since string) bool {
+	out, err := e.dockerRun(ctx, "events", "--since", since, "--until", strconv.FormatInt(time.Now().Unix()+1, 10),
+		"--filter", "container="+builderContainer(name), "--filter", "event=oom")
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
+// oomError is the failure a build gets when its slot's builder was killed. restarted: the container
+// came back with a new StartedAt (oom_kill reset); confirmed: docker also recorded an oom event for
+// it. A restart without that record is reported as such, not as a certain OOM.
+func (e *engine) oomError(cause error, restarted, confirmed bool) error {
+	if restarted && !confirmed {
+		return fmt.Errorf("build failed and its builder restarted during the build (possibly out of memory against the %dMiB slot limit; docker recorded no oom event): %w",
+			e.cfg.SlotMemory>>20, cause)
+	}
 	how := "killed by the kernel"
 	if restarted {
-		how = "its builder was killed and restarted, almost certainly by the kernel OOM killer"
+		how = "its builder was killed and restarted by the kernel OOM killer"
 	}
 	return fmt.Errorf("out of memory: the build exceeded its %dMiB slot limit (memory = memory-swap, %s); reduce its memory use (e.g. Gradle workers, -Xmx) or ask the operator to raise BUILD_SLOT_MEMORY: %w",
 		e.cfg.SlotMemory>>20, how, cause)
