@@ -213,7 +213,9 @@ func (e *engine) rotateTags(ctx context.Context, full string) {
 // take the build slot: BuildKit prunes only records no running solve uses (the base agent ran it
 // alongside the next build), so holding a slot for a prune that can take minutes would put it back on
 // the next build's critical path. The only hazard is a container create/repair/recreate overlapping
-// the prune, which the per-builder maintenance mutex excludes. The size bounds are per builder, so the
+// the prune, which the per-builder maintenance mutex excludes. Known cost, same as the base agent: the
+// prune's work runs inside the slot's cgroup, so with a build near its cap a large prune is charged to
+// that build's memory and can tip it into an OOM kill (reported as OOM). The size bounds are per builder, so the
 // agent-wide totals (10GB reserved, 40GB max used) are split across the slots; min-free-space is a
 // host-disk floor and stays whole.
 func (e *engine) boundedGC(ctx context.Context) {
@@ -287,7 +289,7 @@ func (e *engine) buildService(ctx context.Context, b *Build, bld *builder, d Des
 		defer cancel()
 		if ctx.Err() == nil {
 			if oom, restarted := e.buildOOMKilled(qctx, bld.name, before, started); oom {
-				confirmed := restarted && e.oomSeen(qctx, bld.name, before.startedAt)
+				confirmed := restarted && e.oomSeen(qctx, bld.name, started)
 				return serviceResult{}, e.oomError(err, restarted, confirmed)
 			}
 		}

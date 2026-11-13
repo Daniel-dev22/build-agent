@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -347,16 +348,17 @@ func TestReconcileRemovesOrphanVolumesAndSurvivesAFailingSlot(t *testing.T) {
 // oomHost models a slot container: memory.max/memory.events as cgroup v2 shows them inside it, a
 // StartedAt that changes when docker restarts it, and docker's sticky OOMKilled flag.
 type oomHost struct {
-	mu        sync.Mutex
-	kills     int64
-	execOK    bool   // the container is readable
-	maxLine   string // memory.max as the container sees it ("" = the slot cap)
-	startedAt string
-	running   bool
-	oomState  string // reply to the OOMKilled inspect
-	runc      bool   // a RUN step is alive
-	starts    int
-	oomEvent  bool // docker recorded an oom event for the container
+	mu         sync.Mutex
+	kills      int64
+	execOK     bool   // the container is readable
+	maxLine    string // memory.max as the container sees it ("" = the slot cap)
+	startedAt  string
+	running    bool
+	oomState   string // reply to the OOMKilled inspect
+	runc       bool   // a RUN step is alive
+	starts     int
+	oomEvent   bool // docker recorded an oom event for the container
+	eventsArgs []string
 }
 
 func (o *oomHost) fn(_ context.Context, args ...string) (string, error) {
@@ -379,6 +381,7 @@ func (o *oomHost) fn(_ context.Context, args ...string) (string, error) {
 		}
 		return fmt.Sprintf("%s\nlow 0\nhigh 0\nmax 5\noom 1\noom_kill %d\noom_group_kill 0", max, o.kills), nil
 	case "events":
+		o.eventsArgs = args
 		if o.oomEvent {
 			return "2026-11-13T10:07:00 container oom buildx_buildkit_b0", nil
 		}
@@ -458,8 +461,12 @@ func TestRestartWithoutAnOOMEventIsNotClaimedAsOOM(t *testing.T) {
 		o := newOOMHost()
 		o.oomEvent = tc.event
 		e := oomEngine(o)
-		before := e.probeSlot(context.Background(), "b")
-		confirmed := e.oomSeen(context.Background(), "b", before.startedAt)
+		buildStart := time.Now()
+		confirmed := e.oomSeen(context.Background(), "b", buildStart)
+		// The bound is the BUILD's start, never the container's (possibly weeks-old) StartedAt.
+		if want := strconv.FormatInt(buildStart.Unix(), 10); !slices.Contains(o.eventsArgs, want) || strings.Contains(strings.Join(o.eventsArgs, " "), "2026-11-13T10:00:00Z") {
+			t.Fatalf("events must be queried --since the build start %s: %v", want, o.eventsArgs)
+		}
 		err := e.oomError(errors.New("x"), true, confirmed).Error()
 		if !strings.Contains(err, tc.want) || strings.Contains(err, tc.not) {
 			t.Errorf("event=%v: %s", tc.event, err)
@@ -604,9 +611,10 @@ func TestBuildServiceReportsOOMOnlyWhenTheSlotCgroupKilled(t *testing.T) {
 
 // ---- GC across slots --------------------------------------------------------------------------------
 
-// GC is derived from docker (slot containers that exist), not from what this process used, and a slot
-// a build holds is skipped so a prune never overlaps its create/repair.
-func TestBoundedGCPrunesEveryExistingFreeSlotWithSplitBounds(t *testing.T) {
+// GC is derived from docker (slot containers that exist), not from what this process used. It does not
+// take the build slot: a slot a build holds is pruned too (the prune is excluded from create/repair by
+// the maint mutex instead, see TestPruneBlocksOnlyBuilderMutationsNeverTheReusePath).
+func TestBoundedGCPrunesEveryExistingSlotWithSplitBounds(t *testing.T) {
 	var mu sync.Mutex
 	var prunes []string
 	existing := map[string]bool{"buildx_buildkit_b0": true}

@@ -118,8 +118,9 @@ type builder struct {
 	name       string // buildx builder name
 	recreated  bool   // CC_RECREATE_BUILDER already honoured for this slot
 	idleWarned bool   // stepsRunning could not ask this slot; said so once
-	// maint serialises the operations that MUTATE the builder container (create / repair / recreate)
-	// against the GC prune. A build never takes it on the reuse fast path, and the prune does not take
+	// maint serialises the operations that rebuild the builder container (create / repair / recreate)
+	// against the GC prune. (probeSlot's `docker start` of a stopped container is not covered: it is
+	// idempotent and cannot change the container's identity or cap, so it cannot corrupt a prune.) A build never takes it on the reuse fast path, and the prune does not take
 	// the slot, so neither ever waits for the other unless a repair actually coincides with a prune.
 	maint sync.Mutex
 }
@@ -382,9 +383,14 @@ func (e *engine) waitIdle(ctx context.Context, b *Build, bld *builder, limit tim
 	}
 }
 
-// oomSeen asks docker whether it recorded an oom event for the slot container since the given time.
-func (e *engine) oomSeen(ctx context.Context, name, since string) bool {
-	out, err := e.dockerRun(ctx, "events", "--since", since, "--until", strconv.FormatInt(time.Now().Unix()+1, 10),
+// oomSeen asks docker whether it recorded an oom event for the slot container since the given time,
+// which MUST be the build's own start: an event from an earlier build's RUN-step kill is not evidence
+// about this one. Docker replays `--since` from a finite in-memory event ring (~256 events, and every
+// exec adds several), so on a very busy daemon the event can scroll out before this runs; that fails
+// toward the hedged "possibly out of memory" wording, never toward a false certainty, and this is the
+// first exec in the failure path to keep the window short.
+func (e *engine) oomSeen(ctx context.Context, name string, since time.Time) bool {
+	out, err := e.dockerRun(ctx, "events", "--since", strconv.FormatInt(since.Unix(), 10), "--until", strconv.FormatInt(time.Now().Unix()+1, 10),
 		"--filter", "container="+builderContainer(name), "--filter", "event=oom")
 	return err == nil && strings.TrimSpace(out) != ""
 }
