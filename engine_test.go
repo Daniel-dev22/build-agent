@@ -92,9 +92,9 @@ func TestRepoSlugAndTokenURL(t *testing.T) {
 			t.Errorf("repoSlug(%q)=%q want %q", in, got, want)
 		}
 	}
-	url := githubTokenURL("git@github.com:example-org/example-repo.git", "TOK")
-	if url != "https://x-access-token:TOK@github.com/example-org/example-repo.git" {
-		t.Errorf("token url: %q", url)
+	url := githubCloneURL("git@github.com:example-org/example-repo.git")
+	if url != "https://github.com/example-org/example-repo.git" {
+		t.Errorf("clone url: %q", url)
 	}
 }
 

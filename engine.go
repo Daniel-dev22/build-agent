@@ -126,20 +126,6 @@ func renderBuildArgs(d Descriptor, svc ServiceSpec, versionTag, apkBust string) 
 	return out
 }
 
-// gitClone clones repo@ref (shallow) into dir. For private repos a vended GitHub
-// App token is injected into the URL; the token never lands on disk in the clone.
-func (e *engine) gitClone(ctx context.Context, b *Build, repo, ref, dir, token string) error {
-	url := repo
-	if token != "" {
-		url = githubTokenURL(repo, token)
-	}
-	cctx, cancel := context.WithTimeout(ctx, e.cfg.GitTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", cloneArgs(url, ref, dir)...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	return e.stream(b, "git", cmd, nil)
-}
-
 // cloneArgs builds the `git clone` argv. Pure so the end-of-options separator is
 // testable: "--" means a repo URL or directory beginning with "-" can never be
 // read as an option (git would otherwise treat it as one, and an "ext::" URL as a
@@ -590,9 +576,4 @@ func repoSlug(repo string) string {
 		return s[i+len("github.com/"):]
 	}
 	return s
-}
-
-// githubTokenURL rewrites a repo URL to the token-bearing https clone form.
-func githubTokenURL(repo, token string) string {
-	return "https://x-access-token:" + token + "@github.com/" + repoSlug(repo) + ".git"
 }
