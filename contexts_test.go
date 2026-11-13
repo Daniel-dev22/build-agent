@@ -217,9 +217,10 @@ func TestBuildxArgsPushesBothTagsFromOneBuild(t *testing.T) {
 func TestRunReportsTagAndDigestAndNeverCopiesFromLatest(t *testing.T) {
 	e := newRunEngine(t, Config{FastLane: 1, SlowLane: 1, RetentionKeepDefault: 15})
 	var dockerCalls []string
-	e.docker = func(_ context.Context, args ...string) (string, error) {
+	healthy := fakeDocker(e.cfg)
+	e.docker = func(ctx context.Context, args ...string) (string, error) {
 		dockerCalls = append(dockerCalls, strings.Join(args, " "))
-		return "", nil
+		return healthy(ctx, args...)
 	}
 	e.execBuildx = fakeBuildx(nil)
 	d := Descriptor{Project: "p", ImagePrefix: "pre-", Services: []ServiceSpec{
@@ -328,18 +329,18 @@ func TestPruneOldTagsKeepsDigestsSharedWithLiveTags(t *testing.T) {
 	}
 }
 
-// ---- handler: over-ceiling manifest is a 400 with a clear message -------------------------------
+// ---- handler: over-slot manifest is a 400 with a clear message -------------------------------
 
-func TestTriggerRejectsAMemoryAskAboveTheCeiling(t *testing.T) {
+func TestTriggerRejectsAMemoryAskAboveTheSlot(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	a := &app{cfg: Config{MemoryCeiling: 7 << 30}}
+	a := &app{cfg: Config{MemoryCeiling: 8 << 30, SlotMemory: 4 << 30}}
 	body := `{"descriptor":{"project":"p","services":[{"name":"android","memory":"16g"}]},"registry":"r","repo":"x"}`
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/builds", strings.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	a.handleTriggerBuild(c)
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "BUILD_MEMORY_CEILING") || !strings.Contains(w.Body.String(), "android") {
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "BUILD_SLOT_MEMORY") || !strings.Contains(w.Body.String(), "android") {
 		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
 	}
 }

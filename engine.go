@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -75,13 +74,9 @@ type engine struct {
 	// for the builder create/inspect/cap logic, which would otherwise need a docker daemon.
 	docker func(ctx context.Context, args ...string) (string, error)
 
-	// sched holds the agent-wide lane and memory limits. One per engine, so one per agent: it is
-	// what makes a lane limit bind ACROSS concurrent jobs rather than within each.
+	// sched holds the agent-wide lane limits and the memory-capped build slots. One per engine, so one
+	// per agent: it is what makes a limit bind ACROSS concurrent jobs rather than within each.
 	sched *scheduler
-
-	builderMu sync.Mutex // serializes ensureBuilder's inspect-then-create
-	ensured   atomic.Int32 // jobs past ensureBuilder and not yet finished
-	recreated bool       // CC_RECREATE_BUILDER already honoured (guarded by builderMu)
 }
 
 func newEngine(cfg Config, cc *http.Client) *engine {
@@ -153,57 +148,43 @@ func cloneArgs(url, ref, dir string) []string {
 	return append(args, "--", url, dir)
 }
 
-// ensureBuilder reuses the persistent buildx builder (cache mounts survive) and (re)creates it
-// only when missing, when it does not carry the memory cap, or once per agent lifetime when
-// CC_RECREATE_BUILDER=1.
-//
-// Serialized: concurrent jobs would otherwise race inspect-then-create on the one builder. The cap
-// is judged on the builder CONTAINER, not the buildx store (memory.go): after a redeploy the store
-// is empty while the uncapped container survives, and buildx create over it silently drops the
-// limits. An uncapped container is repaired in place (container removed, state volume kept) when no
-// service is running; the cap is ALWAYS re-verified after a create, and the job fails loudly only
-// if the repair itself did not produce a capped builder.
-func (e *engine) ensureBuilder(ctx context.Context, b *Build) error {
-	e.builderMu.Lock()
-	defer e.builderMu.Unlock()
-	name := e.cfg.Builder
+// ensureBuilder makes the slot's builder exist and carry the memory cap. It is called by the holder
+// of the slot, so nothing else is using that builder and create / repair / recreate need no busy
+// check. The builder is reused (cache mounts survive) and (re)created only when missing, when it
+// does not carry the cap (container removed, state volume kept), or once per slot per agent lifetime
+// when CC_RECREATE_BUILDER=1. The cap is judged on the builder CONTAINER, not the buildx store
+// (memory.go), and ALWAYS re-verified after a create: the job fails loudly if it is not in force.
+func (e *engine) ensureBuilder(ctx context.Context, b *Build, bld *builder) error {
+	name := bld.name
 	_, inspectErr := e.dockerRun(ctx, "buildx", "inspect", name)
 	storeOK := inspectErr == nil
-	exists, capped := storeOK, true // no ceiling: the store alone decides, as before
-	if e.cfg.MemoryCeiling > 0 {
-		var err error
-		if exists, capped, err = e.containerState(ctx); err != nil {
-			return fmt.Errorf("inspect builder: %w", err)
-		}
+	exists, capped, err := e.containerState(ctx, name)
+	if err != nil {
+		return fmt.Errorf("inspect builder: %w", err)
 	}
-	capOK := e.cfg.MemoryCeiling <= 0 || capped
-	recreate := os.Getenv("CC_RECREATE_BUILDER") == "1" && !e.recreated
-	if storeOK && exists && capOK && !recreate {
+	recreate := os.Getenv("CC_RECREATE_BUILDER") == "1" && !bld.recreated
+	if storeOK && exists && capped && !recreate {
+		bld.ensured.Store(true)
 		b.appendLine("[builder] reusing " + name)
 		return nil
 	}
-	if recreate {
-		// Explicit operator request, honoured once per agent lifetime (it used to fire on every job
-		// while set, deleting the cache volume each time). Clean builder, state included.
-		if e.builderBusy() {
-			return fmt.Errorf("CC_RECREATE_BUILDER requested but builds are running; it is honoured by the next job once idle")
-		}
-		e.recreated = true
-		if err := e.recreateClean(ctx); err != nil {
+	switch {
+	case recreate:
+		// Explicit operator request, honoured once per slot per agent lifetime. Clean builder, state
+		// included.
+		bld.recreated = true
+		if err := e.recreateClean(ctx, name); err != nil {
 			return err
 		}
-	} else if exists && !capOK {
-		if e.builderBusy() {
-			return fmt.Errorf("builder %s does not carry BUILD_MEMORY_CEILING (%d bytes) and builds are running; it is repaired by the next job once idle", name, e.cfg.MemoryCeiling)
-		}
+	case exists && !capped:
 		b.appendLine("[builder] repairing: container lacks the memory cap, recreating it (state volume kept)")
-		if err := e.repairBuilder(ctx); err != nil {
+		if err := e.repairBuilder(ctx, name); err != nil {
 			return err
 		}
-	} else if storeOK && !exists {
+	case storeOK && !exists:
 		_, _ = e.dockerRun(ctx, "buildx", "rm", "--keep-state", name) // stale store entry, container gone
 	}
-	out, err := e.dockerRun(ctx, builderCreateArgs(e.cfg)...)
+	out, err := e.dockerRun(ctx, builderCreateArgs(e.cfg, name)...)
 	for _, l := range strings.Split(out, "\n") {
 		if l != "" {
 			b.appendLine("[builder] " + l)
@@ -212,21 +193,12 @@ func (e *engine) ensureBuilder(ctx context.Context, b *Build) error {
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
 	}
-	if e.cfg.MemoryCeiling > 0 {
-		_, capped, err := e.containerState(ctx)
-		if err != nil || !capped {
-			return fmt.Errorf("builder %s was created but does not carry BUILD_MEMORY_CEILING (%d bytes): %v", name, e.cfg.MemoryCeiling, err)
-		}
+	if _, capped, err := e.containerState(ctx, name); err != nil || !capped {
+		return fmt.Errorf("builder %s was created but does not carry BUILD_SLOT_MEMORY (%d bytes, memory = memory-swap): %v", name, e.cfg.SlotMemory, err)
 	}
+	bld.ensured.Store(true)
 	b.appendLine("[builder] created " + name)
 	return nil
-}
-
-// builderBusy reports whether anything could be using the builder: a service inside buildx, or a job
-// that already passed ensureBuilder and has not finished (it may be about to be admitted). Repairs
-// and recreates are only done when neither holds, which closes the repair-versus-admission race.
-func (e *engine) builderBusy() bool {
-	return (e.sched != nil && e.sched.running.Load() > 0) || e.ensured.Load() > 0
 }
 
 func (e *engine) rotateTags(ctx context.Context, full string) {
@@ -235,26 +207,36 @@ func (e *engine) rotateTags(ctx context.Context, full string) {
 	}
 }
 
+// boundedGC prunes every slot builder that has been used. The size bounds are per builder, so the
+// agent-wide totals (10GB reserved, 40GB max used) are split across the slots; min-free-space is a
+// host-disk floor and stays whole.
 func (e *engine) boundedGC(ctx context.Context) {
-	start := time.Now()
-	out, err := e.dockerRun(ctx, "buildx", "prune", "--builder", e.cfg.Builder, "--force",
-		"--reserved-space", "10GB", "--max-used-space", "40GB", "--min-free-space", "20GB",
-		"--filter", "until=168h")
-	// Always log the duration. This step cost one build 155.7 seconds while
-	// emitting nothing at all, so its only trace was a gap between two timestamps
-	// in a table nobody reads. A prune that starts taking minutes should be
-	// visible before it is load-bearing again.
-	if err != nil {
-		slog.Warn("bounded gc", "error", err, "took", time.Since(start), "out", strings.TrimSpace(string(out)))
-		return
+	n := int64(max(len(e.sched.slots.builders), 1))
+	reserved, maxUsed := strconv.FormatInt(10<<30/n, 10), strconv.FormatInt(40<<30/n, 10)
+	for _, bld := range e.sched.slots.builders {
+		if !bld.ensured.Load() {
+			continue
+		}
+		start := time.Now()
+		out, err := e.dockerRun(ctx, "buildx", "prune", "--builder", bld.name, "--force",
+			"--reserved-space", reserved, "--max-used-space", maxUsed, "--min-free-space", "20GB",
+			"--filter", "until=168h")
+		// Always log the duration. This step cost one build 155.7 seconds while
+		// emitting nothing at all, so its only trace was a gap between two timestamps
+		// in a table nobody reads. A prune that starts taking minutes should be
+		// visible before it is load-bearing again.
+		if err != nil {
+			slog.Warn("bounded gc", "builder", bld.name, "error", err, "took", time.Since(start), "out", out)
+			continue
+		}
+		slog.Info("bounded gc", "builder", bld.name, "took", time.Since(start))
 	}
-	slog.Info("bounded gc", "took", time.Since(start))
 }
 
 // buildService runs one service through buildx + tagging + retention. token is
 // passed as a buildx secret (id=ghtoken) so the Dockerfile can `go mod download`
 // private modules. Returns the resulting image repo path on success.
-func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc ServiceSpec, registry, versionTag, apkBust, secretFile string, prov provenance, tagRotation bool, retentionKeep int, notify func(), bx buildExtras) (serviceResult, error) {
+func (e *engine) buildService(ctx context.Context, b *Build, bld *builder, d Descriptor, svc ServiceSpec, registry, versionTag, apkBust, secretFile string, prov provenance, tagRotation bool, retentionKeep int, notify func(), bx buildExtras) (serviceResult, error) {
 	image := d.ImagePrefix + svc.Name
 	full := registry + "/" + image
 	dockerfile := svc.dockerfile()
@@ -268,7 +250,7 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 	// buildx writes the pushed manifest digest here. It sits in the job root, beside the context,
 	// so it is never shipped to BuildKit and is removed with the job.
 	bx.metadataFile = filepath.Join(b.jobRoot(), "meta-"+svc.Name+".json")
-	args := buildxArgs(e.cfg.Builder, d, svc, full, dockerfile, versionTag, apkBust, secretFile, prov, bx)
+	args := buildxArgs(bld.name, d, svc, full, dockerfile, versionTag, apkBust, secretFile, prov, bx)
 
 	// Parse buildx stage-step lines off the same stream and surface them as a
 	// live indicator. Only a real step change broadcasts (setServiceStep dedupes),
@@ -284,7 +266,19 @@ func (e *engine) buildService(ctx context.Context, b *Build, d Descriptor, svc S
 	if run == nil {
 		run = e.execBuildxDocker
 	}
+	// The slot is exclusively ours, so its cgroup's oom_kill counter moving during the build is OUR
+	// build being killed for memory: report it as such, not as a generic buildx failure.
+	started := time.Now()
+	oomBefore, haveBefore := e.oomKillCount(ctx, bld.name)
 	if err := run(ctx, b, svc, args, b.workdir(), onLine); err != nil {
+		// A cancel or timeout also ends in 137 but is not OOM; ask on a fresh context otherwise.
+		if ctx.Err() == nil {
+			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			if e.buildOOMKilled(qctx, bld.name, oomBefore, haveBefore, started) {
+				return serviceResult{}, e.oomError(err)
+			}
+		}
 		return serviceResult{}, err
 	}
 	// The versioned tag was pushed by the build itself (see buildxArgs), so it cannot point at
@@ -430,7 +424,7 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 	// only part that cannot be known yet — it needs the clone to exist.
 	prov := provenanceFor(req)
 
-	// Setup phases (vend, clones, builder, pre_build, cache check) run under their own deadline.
+	// Setup phases (vend, clones, pre_build, cache check) run under their own deadline.
 	// Admission below has none, and BUILD_TIMEOUT starts per service at admission, so a hung setup
 	// step fails ITS job and releases builderMu instead of wedging every later job.
 	jobCtx := ctx
@@ -491,13 +485,6 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 		return
 	}
 	b.setSources(prov.Revision, ctxResults)
-	if err := e.ensureBuilder(ctx, b); err != nil {
-		fail(err.Error())
-		return
-	}
-	e.ensured.Add(1) // from here this job may be admitted at any moment: no repair of the builder
-	defer e.ensured.Add(-1)
-
 	// Project pre-build hook: run the descriptor's PreBuild commands in the freshly
 	// populated workdir before any service builds — e.g. a `make version` step that
 	// stamps a generated version file the Dockerfile then copies in. Fail the whole
@@ -542,7 +529,7 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 		go func(svc ServiceSpec) {
 			defer wg.Done()
 			// Agent-wide admission (lane slot + memory reservation); blocks while other jobs hold them.
-			releaseSlot, aerr := e.sched.admit(ctx, limits, svc)
+			bld, releaseSlot, aerr := e.sched.admit(ctx, limits, svc)
 			if aerr != nil {
 				b.setServiceState(svc.Name, SvcFailed, func(sp *ServiceProgress) { sp.Err = "admission: " + aerr.Error() })
 				onChange(EventProgress)
@@ -553,6 +540,13 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			bctx, bcancel := e.buildDeadline(ctx)
 			defer bcancel()
 
+			// The slot is ours alone: create / repair its capped builder before building.
+			if err := e.ensureBuilder(bctx, b, bld); err != nil {
+				b.setServiceState(svc.Name, SvcFailed, func(sp *ServiceProgress) { sp.Err = err.Error() })
+				onChange(EventProgress)
+				return
+			}
+
 			b.setServiceState(svc.Name, SvcBuilding, func(sp *ServiceProgress) {
 				now := time.Now().UTC()
 				sp.StartedAt = &now
@@ -560,7 +554,7 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			})
 			onChange(EventProgress)
 
-			res, err := e.buildService(bctx, b, d, svc, registry, versionTag, apkBust, secretFile, prov, tagRotation, retentionKeep, notify, buildExtras{contexts: namedCtxs})
+			res, err := e.buildService(bctx, b, bld, d, svc, registry, versionTag, apkBust, secretFile, prov, tagRotation, retentionKeep, notify, buildExtras{contexts: namedCtxs})
 			finish := func(sp *ServiceProgress) {
 				now := time.Now().UTC()
 				sp.EndedAt = &now
@@ -574,7 +568,12 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			if err != nil {
 				b.setServiceState(svc.Name, SvcFailed, func(sp *ServiceProgress) { finish(sp); sp.Err = err.Error() })
 			} else {
-				b.setServiceState(svc.Name, SvcDone, func(sp *ServiceProgress) { finish(sp); sp.Image = res.Image; sp.Tag = versionTag; sp.Digest = res.Digest })
+				b.setServiceState(svc.Name, SvcDone, func(sp *ServiceProgress) {
+					finish(sp)
+					sp.Image = res.Image
+					sp.Tag = versionTag
+					sp.Digest = res.Digest
+				})
 			}
 			onChange(EventProgress)
 		}(svc)

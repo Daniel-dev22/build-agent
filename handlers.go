@@ -29,7 +29,7 @@ func (a *app) handleTriggerBuild(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "descriptor." + err.Error()})
 		return
 	}
-	if err := req.Descriptor.checkMemory(a.cfg.MemoryCeiling); err != nil {
+	if err := req.Descriptor.checkMemory(a.cfg.SlotMemory); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "descriptor." + err.Error()})
 		return
 	}

@@ -543,7 +543,7 @@ func TestBuildServicePassesItsProvenanceIntoTheArgv(t *testing.T) {
 	prov := provenance{Context: contextGit, Repo: "https://github.com/o/r", Ref: "0.19", Revision: "deadbeef"}
 	// tagVersioned/pruneOldTags would need docker; the seam returns early so the
 	// argv is what we assert on.
-	_, err := e.buildService(context.Background(), b, Descriptor{}, ServiceSpec{Name: "app", Dockerfile: "Dockerfile"},
+	_, err := e.buildService(context.Background(), b, &builder{name: "b"}, Descriptor{}, ServiceSpec{Name: "app", Dockerfile: "Dockerfile"},
 		"reg", "v", "a", "", prov, false, 3, nil, buildExtras{})
 	if err == nil {
 		t.Fatal("expected the seam's sentinel error")

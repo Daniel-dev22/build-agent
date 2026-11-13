@@ -37,13 +37,12 @@ type Config struct {
 	GitTimeout           time.Duration // per-clone timeout
 	BuildTimeout         time.Duration // hard ceiling per build job
 
-	// MemoryCeiling (BUILD_MEMORY_CEILING, e.g. "7g") is the hard memory cap on the persistent
-	// BuildKit builder (memory = memory-swap) AND the budget that per-service manifest `memory`
-	// reservations are admitted against. 0 = unset: no cap, no reservations (previous behaviour).
+	// MemoryCeiling (BUILD_MEMORY_CEILING, e.g. "8g", REQUIRED) is the host memory budget the build
+	// slots are carved from. SlotMemory (BUILD_SLOT_MEMORY, e.g. "4g", default = the ceiling) is the
+	// hard per-build cap: every concurrent build runs on its own BuildKit builder created with
+	// memory = memory-swap = SlotMemory, and there are floor(ceiling / slot) of them.
 	MemoryCeiling int64
-	// MemoryDefault (BUILD_MEMORY_DEFAULT, default "1g") is the reservation charged to a service
-	// whose manifest sets no `memory`. Only meaningful when a ceiling is set.
-	MemoryDefault int64
+	SlotMemory    int64
 
 	// SetupTimeout (BUILD_SETUP_TIMEOUT, default 20m) bounds a job's non-admission phases (token vend,
 	// clones, builder ensure, pre_build, cache validation). Admission has no deadline by design;
@@ -89,7 +88,14 @@ func loadConfig() Config {
 		PrivateRepoOwners:    getEnvList("PRIVATE_REPO_OWNERS"),
 	}
 	cfg.MemoryCeiling = requireBytes("BUILD_MEMORY_CEILING", "")
-	cfg.MemoryDefault = requireBytes("BUILD_MEMORY_DEFAULT", "1g")
+	cfg.SlotMemory = requireBytes("BUILD_SLOT_MEMORY", "")
+	if cfg.SlotMemory == 0 {
+		cfg.SlotMemory = cfg.MemoryCeiling
+	}
+	if err := cfg.validateMemory(); err != nil {
+		slog.Error("invalid memory configuration", "error", err)
+		os.Exit(1)
+	}
 	tok, err := readBearerToken(cfg.BearerTokenFile)
 	if err != nil {
 		slog.Error("bearer token unreadable — cannot authenticate to controller",

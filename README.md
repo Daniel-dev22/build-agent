@@ -390,9 +390,11 @@ without a controller you must still place a non-empty file there.
 | `TRAEFIK_DOCKER_DNS` | `""` | If set, every controller connection is dialled to this host instead of the URL's own host, while the Host header and TLS SNI keep the original name — the shape needed when a local reverse-proxy container attaches the client certificate. Empty ⇒ dial the URL host directly. |
 | `TRAEFIK_DIAL_PORT` | `1443` | Port used with `TRAEFIK_DOCKER_DNS`. Ignored when that is empty. |
 | `PRIVATE_REPO_OWNERS` | `""` | Comma-separated GitHub owners/orgs (e.g. `acme,example-org`) whose repos are treated as private when `private` is not set on the request, triggering an installation-token vend. Empty ⇒ **nothing** is inferred private. Matched as `"<owner>/"` against the repo URL. |
-| `BUILDX_BUILDER` | `build-agent-builder` | Name of the persistent `docker-container` buildx builder. Reused across builds so BuildKit cache mounts survive. |
+| `BUILDX_BUILDER` | `build-agent-builder` | Name of slot 0's persistent `docker-container` buildx builder (further slots are `<name>-s<i>`). Reused across builds so BuildKit cache mounts survive. |
 | `BUILDKITD_CONFIG` | `""` | Path to a `buildkitd.toml` passed as `--buildkitd-config` when the builder is created. Silently skipped if the path does not exist. |
 | `CC_RECREATE_BUILDER` | unset | Set to `1` to force the builder to be destroyed and recreated on the next build — needed after editing `BUILDKITD_CONFIG`, since an existing builder is otherwise reused as-is. |
+| `BUILD_MEMORY_CEILING` | required | Host memory budget the build slots are carved from, e.g. `8g`. The agent refuses to start without it. |
+| `BUILD_SLOT_MEMORY` | = ceiling | Hard per-build cap (memory = memory-swap) applied to each slot's builder, e.g. `4g`. Slots = floor(ceiling / slot). |
 | `BUILD_FAST_LANE` | `2` | Default max concurrent fast-lane service builds. A descriptor's `lanes.fast` overrides it. |
 | `BUILD_SLOW_LANE` | `1` | Default max concurrent slow-lane service builds. A descriptor's `lanes.slow` overrides it. |
 | `REGISTRY_RETENTION_KEEP` | `15` | Default timestamp-tag retention. A descriptor's `retention_keep` overrides it. |
@@ -535,7 +537,7 @@ Sibling agents built on the same kit:
 Descriptor and request fields, all optional; every existing build.json stays valid.
 
 - Agent-wide lanes: BUILD_FAST_LANE / BUILD_SLOW_LANE bind across ALL concurrent jobs. A descriptor lanes block may only lower them for its own job.
-- Memory: BUILD_MEMORY_CEILING (e.g. 7g) is a hard cap (memory = memory-swap) on the persistent BuildKit builder, applied at startup (rm --keep-state keeps the cache volume). Per-service memory (e.g. 6g) is a RESERVATION admitted against the ceiling (FIFO); above the ceiling the trigger is rejected with a 400. Services without memory reserve BUILD_MEMORY_DEFAULT (1g). Unset ceiling = previous behaviour.
+- Memory: every build runs on its own BuildKit builder (a "slot") created with memory = memory-swap = BUILD_SLOT_MEMORY (e.g. 4g), so the cap is per BUILD: one that outgrows it is OOM-killed alone and reported as `out of memory: ...` (from the slot cgroup's oom_kill counter), not as a generic failure. BUILD_MEMORY_CEILING (e.g. 8g, REQUIRED, no uncapped mode) is the host budget; slots = floor(ceiling / slot), so the caps never sum above it. Slot 0 is BUILDX_BUILDER (existing container + cache volume reused, cap repaired), slot i is BUILDX_BUILDER-s<i> with its own cache mounts; the lowest free slot is taken. A service waits FIFO for a free slot after its lane. Per-service `memory` is only validated against the slot (above it the trigger is a 400). BUILD_SLOT_MEMORY defaults to the ceiling (one slot). Slots above the count are retired at startup with their volume; GC bounds are split across slots.
 - platform: per service, e.g. {mode: fixed, value: linux/amd64} (already supported; the default stays multi-arch).
 - contexts: {kit: {repo, ref}} cloned with the job token, ref resolved to a SHA, passed as --build-context kit=DIR. The request may override a ref with context_refs: {kit: ref}.
 - skip_latest (service): push only the versioned tag, leave :latest and :stable alone (artifact images such as a FROM scratch AAB). Retention keeps the newest N timestamp tags and never deletes a digest still used by a kept tag or :latest.

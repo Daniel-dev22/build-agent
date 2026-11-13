@@ -6,24 +6,31 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // Memory caps.
 //
-// BuildKit runs as ONE persistent docker-container builder, so its cgroup limit is fixed when the
-// builder CONTAINER is created: there is no per-job cgroup. That decides the whole design:
+// Every build runs on a SLOT: a persistent BuildKit docker-container builder of its own, created with
+// memory = memory-swap = BUILD_SLOT_MEMORY. A container is the only cgroup BuildKit offers (it cannot
+// limit one solve, and two buildkitds cannot share a state dir), so one builder per slot is what
+// makes the cap per BUILD rather than per pool: a build that outgrows its slot is OOM-killed alone and
+// its sibling, in another cgroup, never notices.
 //
-//   - the OPERATOR sets BUILD_MEMORY_CEILING; the builder container is created with memory =
-//     memory-swap = ceiling, a hard cap with no swap. This is the only real enforcement.
-//     Sizing rule (deploy config, not code): ceiling = floor_0.5GiB(p1 MemAvailable over >= 7 days
-//     with the builder idle - max(1.5 GiB, 20%)), then size the heaviest build (Gradle -Xmx, workers)
-//     so its measured memory.peak <= ceiling - 0.5g. Never raise the ceiling to make a build fit.
-//   - a service's manifest `memory` is a RESERVATION, not a cgroup setting. The scheduler admits a
-//     service only while the reservations of running services fit under the ceiling. It is honour
-//     system: declare `memory` on every heavy service, the default only charges BUILD_MEMORY_DEFAULT.
-//   - a manifest value above the ceiling is rejected with a clear error.
+//   - BUILD_MEMORY_CEILING is the host budget, BUILD_SLOT_MEMORY the per-build cap (default = the
+//     ceiling, i.e. one slot). Slots = floor(ceiling / slot), so the caps can never sum above the
+//     ceiling. The ceiling is required: there is no uncapped mode.
+//   - slot 0 is the original builder (BUILDX_BUILDER), so its container and state volume (the
+//     Gradle/Go cache mounts) are reused; slot i is BUILDX_BUILDER-s<i>. The lowest free slot is
+//     always taken so serial builds keep hitting the warm cache.
+//   - a build holds its slot exclusively from admission to exit, so create / repair / recreate of that
+//     slot's builder never races a running build.
+//   - a service's manifest `memory` is only validated against the slot cap (it is no reservation: a
+//     slot is the unit of isolation).
 //
 // The decision "is the cap in force?" is made on the builder CONTAINER (docker inspect), never on the
 // buildx builder store: the store lives in the agent container's filesystem and is lost on every
@@ -59,30 +66,64 @@ func parseBytes(s string) (int64, error) {
 	return v * mult, nil
 }
 
-// checkMemory validates every service's `memory` against the operator ceiling. ceiling <= 0 means no
-// ceiling is configured: values are syntax-checked but not enforced.
-func (d Descriptor) checkMemory(ceiling int64) error {
+// validateMemory checks the memory knobs. There is deliberately no "unset" branch: a build without a
+// hard cap is not a mode this agent has.
+func (c Config) validateMemory() error {
+	switch {
+	case c.MemoryCeiling <= 0:
+		return fmt.Errorf("BUILD_MEMORY_CEILING is required (e.g. 8g): the host budget every build slot is carved from")
+	case c.SlotMemory <= 0:
+		return fmt.Errorf("BUILD_SLOT_MEMORY must be positive")
+	case c.SlotMemory > c.MemoryCeiling:
+		return fmt.Errorf("BUILD_SLOT_MEMORY (%d bytes) exceeds BUILD_MEMORY_CEILING (%d bytes)", c.SlotMemory, c.MemoryCeiling)
+	}
+	return nil
+}
+
+// slotCount is how many builds may run at once under the memory budget.
+func (c Config) slotCount() int {
+	if c.SlotMemory <= 0 {
+		return 0
+	}
+	return int(c.MemoryCeiling / c.SlotMemory)
+}
+
+// checkMemory validates every service's `memory` against the per-build slot cap.
+func (d Descriptor) checkMemory(slot int64) error {
 	for _, s := range d.Services {
 		n, err := parseBytes(s.Memory)
 		if err != nil {
 			return fmt.Errorf("service %s: memory: %w", s.Name, err)
 		}
-		if ceiling > 0 && n > ceiling {
-			return fmt.Errorf("service %s: memory %s exceeds the agent's BUILD_MEMORY_CEILING (%d bytes); lower it or ask the operator to raise the ceiling", s.Name, s.Memory, ceiling)
+		if n > slot {
+			return fmt.Errorf("service %s: memory %s exceeds the agent's BUILD_SLOT_MEMORY (%d bytes); lower it or ask the operator to raise the slot size", s.Name, s.Memory, slot)
 		}
 	}
 	return nil
 }
 
-// builderCreateArgs assembles `docker buildx create`. Pure so the cap flags are testable.
-func builderCreateArgs(cfg Config) []string {
-	args := []string{"buildx", "create", "--name", cfg.Builder,
-		"--driver", "docker-container", "--driver-opt", "network=host"}
-	if cfg.MemoryCeiling > 0 {
-		m := strconv.FormatInt(cfg.MemoryCeiling, 10)
-		args = append(args, "--driver-opt", "memory="+m, "--driver-opt", "memory-swap="+m)
+// builder is one slot's BuildKit builder. Only the holder of the slot touches the mutable fields, so
+// they need no lock.
+type builder struct {
+	idx       int
+	name      string // buildx builder name
+	recreated bool   // CC_RECREATE_BUILDER already honoured for this slot
+	ensured   atomic.Bool
+}
+
+func slotBuilderName(base string, idx int) string {
+	if idx == 0 {
+		return base
 	}
-	args = append(args, "--bootstrap")
+	return base + "-s" + strconv.Itoa(idx)
+}
+
+// builderCreateArgs assembles `docker buildx create` for one slot. Pure so the cap flags are testable.
+func builderCreateArgs(cfg Config, name string) []string {
+	m := strconv.FormatInt(cfg.SlotMemory, 10)
+	args := []string{"buildx", "create", "--name", name,
+		"--driver", "docker-container", "--driver-opt", "network=host",
+		"--driver-opt", "memory=" + m, "--driver-opt", "memory-swap=" + m, "--bootstrap"}
 	if cfg.BuildkitdConfig != "" {
 		if _, err := os.Stat(cfg.BuildkitdConfig); err == nil {
 			args = append(args, "--buildkitd-config", cfg.BuildkitdConfig)
@@ -108,14 +149,16 @@ func (e *engine) dockerRun(ctx context.Context, args ...string) (string, error) 
 	return strings.TrimSpace(string(out)), err
 }
 
-// containerState reports whether the builder container exists and whether it carries the cap.
-// Memory is the enforcing field; MemorySwap is accepted as the ceiling, 0 or -1, because a daemon
-// without swap-limit support drops it, and refusing every build over that would let the guard
-// disable the function it protects.
-func (e *engine) containerState(ctx context.Context) (exists, capped bool, err error) {
-	out, ierr := e.dockerRun(ctx, "inspect", "--format", "{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}", builderContainer(e.cfg.Builder))
+func isNoSuch(out string) bool { return strings.Contains(strings.ToLower(out), "no such") }
+
+// containerState reports whether the slot's container exists and carries the cap. BOTH memory and
+// memory-swap must equal the slot: swap = memory is what makes the cap hard, and swap -1 is unlimited
+// swap. (Under cgroup v2 swap accounting is always on, so a daemon that drops the swap limit is not
+// a case to tolerate.)
+func (e *engine) containerState(ctx context.Context, name string) (exists, capped bool, err error) {
+	out, ierr := e.dockerRun(ctx, "inspect", "--format", "{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}", builderContainer(name))
 	if ierr != nil {
-		if strings.Contains(strings.ToLower(out), "no such") {
+		if isNoSuch(out) {
 			return false, false, nil
 		}
 		return false, false, fmt.Errorf("inspect builder container: %w: %s", ierr, out)
@@ -129,50 +172,101 @@ func (e *engine) containerState(ctx context.Context) (exists, capped bool, err e
 	if err1 != nil || err2 != nil {
 		return true, false, fmt.Errorf("unexpected inspect output %q", out)
 	}
-	c := e.cfg.MemoryCeiling
-	return true, mem == c && (swap == c || swap == 0 || swap == -1), nil
+	return true, mem == e.cfg.SlotMemory && swap == e.cfg.SlotMemory, nil
 }
 
-// repairBuilder makes the builder container carry the ceiling. Only the CONTAINER is removed: its
-// named state volume (the Gradle/Go cache mounts) survives and the recreate reuses it by name. The
-// caller guarantees nothing is building (startup, or builderMu held with zero running services).
-func (e *engine) repairBuilder(ctx context.Context) error {
-	if out, err := e.dockerRun(ctx, "rm", "-f", builderContainer(e.cfg.Builder)); err != nil && !strings.Contains(strings.ToLower(out), "no such") {
+// repairBuilder makes the slot's container carry the cap. Only the CONTAINER is removed: its named
+// state volume (the Gradle/Go cache mounts) survives and the recreate reuses it by name. The caller
+// holds the slot, so nothing is building on it.
+func (e *engine) repairBuilder(ctx context.Context, name string) error {
+	if out, err := e.dockerRun(ctx, "rm", "-f", builderContainer(name)); err != nil && !isNoSuch(out) {
 		return fmt.Errorf("remove uncapped builder container: %w: %s", err, out)
 	}
 	// Drop the (possibly stale) store entry so `buildx create` of the same name is accepted. No
 	// --force and no volume removal: --keep-state.
-	_, _ = e.dockerRun(ctx, "buildx", "rm", "--keep-state", e.cfg.Builder)
+	_, _ = e.dockerRun(ctx, "buildx", "rm", "--keep-state", name)
 	return nil
 }
 
-// recreateClean is the operator's CC_RECREATE_BUILDER: a clean builder, STATE INCLUDED. Keyed on the
-// container and its named state volume, not on the buildx store (which is empty exactly when the
-// env var could be set, since setting it means recreating the agent container). Caller guarantees
-// nothing is building.
-func (e *engine) recreateClean(ctx context.Context) error {
-	c := builderContainer(e.cfg.Builder)
-	if out, err := e.dockerRun(ctx, "rm", "-f", c); err != nil && !strings.Contains(strings.ToLower(out), "no such") {
+// recreateClean is the operator's CC_RECREATE_BUILDER and the retirement of a surplus slot: a clean
+// builder, STATE INCLUDED. Keyed on the container and its named state volume, not on the buildx
+// store (which is empty exactly when the env var could be set, since setting it means recreating the
+// agent container). Caller guarantees nothing is building on it.
+func (e *engine) recreateClean(ctx context.Context, name string) error {
+	c := builderContainer(name)
+	if out, err := e.dockerRun(ctx, "rm", "-f", c); err != nil && !isNoSuch(out) {
 		return fmt.Errorf("remove builder container: %w: %s", err, out)
 	}
-	if out, err := e.dockerRun(ctx, "volume", "rm", c+"_state"); err != nil && !strings.Contains(strings.ToLower(out), "no such") {
+	if out, err := e.dockerRun(ctx, "volume", "rm", c+"_state"); err != nil && !isNoSuch(out) {
 		return fmt.Errorf("remove builder state volume: %w: %s", err, out)
 	}
-	_, _ = e.dockerRun(ctx, "buildx", "rm", "--keep-state", e.cfg.Builder)
+	_, _ = e.dockerRun(ctx, "buildx", "rm", "--keep-state", name)
 	return nil
 }
 
-// reconcileBuilder runs once at startup, before any job is accepted.
-func (e *engine) reconcileBuilder(ctx context.Context) error {
-	if e.cfg.MemoryCeiling <= 0 {
-		return nil
-	}
-	exists, capped, err := e.containerState(ctx)
+// reconcileSlots runs once at startup, before any job is accepted: slot builders above the current
+// slot count (the operator lowered the ceiling or raised the slot size) are removed with their state
+// volume, so a smaller fleet does not leave unbounded cache volumes behind. Slots in range are left
+// alone; each is verified, and repaired, when a build acquires it.
+func (e *engine) reconcileSlots(ctx context.Context) error {
+	out, err := e.dockerRun(ctx, "ps", "-a", "--filter", "name=buildx_buildkit_"+e.cfg.Builder+"-s", "--format", "{{.Names}}")
 	if err != nil {
-		return err
+		return fmt.Errorf("list slot builders: %w: %s", err, out)
 	}
-	if exists && !capped {
-		return e.repairBuilder(ctx)
+	// buildx appends the node index (0) to the builder name: slot 1 is container ...-s10.
+	re := regexp.MustCompile("^buildx_buildkit_" + regexp.QuoteMeta(e.cfg.Builder) + `-s(\d+)0$`)
+	n := e.cfg.slotCount()
+	for _, c := range strings.Fields(out) {
+		m := re.FindStringSubmatch(c)
+		if m == nil {
+			continue
+		}
+		if idx, _ := strconv.Atoi(m[1]); idx >= n {
+			if err := e.recreateClean(ctx, slotBuilderName(e.cfg.Builder, idx)); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+// ---- OOM detection ---------------------------------------------------------------------------------
+
+// oomKillCount reads oom_kill from the slot container's own cgroup (cgroup v2: the container sees its
+// cgroup as /sys/fs/cgroup, and memory.events is hierarchical, so it counts the kill of any RUN step).
+func (e *engine) oomKillCount(ctx context.Context, name string) (int64, bool) {
+	out, err := e.dockerRun(ctx, "exec", builderContainer(name), "cat", "/sys/fs/cgroup/memory.events")
+	if err != nil {
+		return 0, false
+	}
+	for _, l := range strings.Split(out, "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(l), " "); ok && k == "oom_kill" {
+			n, perr := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			return n, perr == nil
+		}
+	}
+	return 0, false
+}
+
+// buildOOMKilled reports whether the build that just failed on the slot was killed for memory: the
+// oom_kill counter moved while this build held the slot (exclusive, so the delta is its own), or, when
+// the container itself died and can no longer be read, docker recorded OOMKilled at or after the
+// build's start. A cancel or timeout also ends in exit 137 but moves neither, so it is not OOM.
+func (e *engine) buildOOMKilled(ctx context.Context, name string, before int64, haveBefore bool, started time.Time) bool {
+	if after, ok := e.oomKillCount(ctx, name); ok && haveBefore {
+		return after > before
+	}
+	out, err := e.dockerRun(ctx, "inspect", "--format", "{{.State.OOMKilled}} {{.State.FinishedAt}}", builderContainer(name))
+	f := strings.Fields(out)
+	if err != nil || len(f) != 2 || f[0] != "true" {
+		return false
+	}
+	fin, perr := time.Parse(time.RFC3339Nano, f[1])
+	return perr == nil && !fin.Before(started)
+}
+
+// oomError is the failure a build gets when its slot's cgroup killed it.
+func (e *engine) oomError(cause error) error {
+	return fmt.Errorf("out of memory: the build exceeded its %dMiB slot limit (memory = memory-swap, killed by the kernel); reduce its memory use (e.g. Gradle workers, -Xmx) or ask the operator to raise BUILD_SLOT_MEMORY: %w",
+		e.cfg.SlotMemory>>20, cause)
 }
