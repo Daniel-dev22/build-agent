@@ -45,10 +45,11 @@ type Config struct {
 	SlotMemory    int64
 
 	// SetupTimeout (BUILD_SETUP_TIMEOUT, default 20m) bounds a job's non-admission phases (token vend,
-	// clones, builder ensure, pre_build, cache validation). Admission has no deadline by design;
+	// clones, pre_build, cache validation). Admission has no deadline by design;
 	// BUILD_TIMEOUT starts when a service is admitted. DockerTimeout (BUILD_DOCKER_TIMEOUT, default
 	// 15m) bounds every single docker CLI call the agent makes outside a build (builder
-	// inspect/create/repair, post-build prune), so a wedged daemon cannot hold builderMu forever.
+	// inspect/create/repair, post-build prune), so a wedged daemon cannot hold a build slot forever. Builder ensure runs after admission, under
+	// the per-service BUILD_TIMEOUT, not SetupTimeout.
 	SetupTimeout  time.Duration
 	DockerTimeout time.Duration
 

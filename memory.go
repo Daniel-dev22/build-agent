@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -66,26 +66,34 @@ func parseBytes(s string) (int64, error) {
 	return v * mult, nil
 }
 
+// minSlotMemory is the smallest slot that can run a build at all (docker itself refuses < 6 MiB; a
+// real build needs far more). It also turns a unitless typo (BUILD_SLOT_MEMORY=4, meaning 4 BYTES)
+// into a startup error instead of millions of slots.
+const minSlotMemory = 256 << 20
+
 // validateMemory checks the memory knobs. There is deliberately no "unset" branch: a build without a
 // hard cap is not a mode this agent has.
 func (c Config) validateMemory() error {
 	switch {
 	case c.MemoryCeiling <= 0:
 		return fmt.Errorf("BUILD_MEMORY_CEILING is required (e.g. 8g): the host budget every build slot is carved from")
-	case c.SlotMemory <= 0:
-		return fmt.Errorf("BUILD_SLOT_MEMORY must be positive")
+	case c.SlotMemory < minSlotMemory:
+		return fmt.Errorf("BUILD_SLOT_MEMORY (%d bytes) is below the %d-byte minimum; did you forget the unit (e.g. 4g)?", c.SlotMemory, int64(minSlotMemory))
 	case c.SlotMemory > c.MemoryCeiling:
 		return fmt.Errorf("BUILD_SLOT_MEMORY (%d bytes) exceeds BUILD_MEMORY_CEILING (%d bytes)", c.SlotMemory, c.MemoryCeiling)
 	}
 	return nil
 }
 
-// slotCount is how many builds may run at once under the memory budget.
+// slotCount is how many builds may run at once: the memory budget allows floor(ceiling / slot), and
+// the lanes allow at most fast + slow, so a slot beyond either bound could never be occupied.
 func (c Config) slotCount() int {
 	if c.SlotMemory <= 0 {
 		return 0
 	}
-	return int(c.MemoryCeiling / c.SlotMemory)
+	byMemory := c.MemoryCeiling / c.SlotMemory
+	byLanes := int64(max(c.FastLane, 1) + max(c.SlowLane, 1))
+	return int(min(byMemory, byLanes))
 }
 
 // checkMemory validates every service's `memory` against the per-build slot cap.
@@ -108,7 +116,6 @@ type builder struct {
 	idx       int
 	name      string // buildx builder name
 	recreated bool   // CC_RECREATE_BUILDER already honoured for this slot
-	ensured   atomic.Bool
 }
 
 func slotBuilderName(base string, idx int) string {
@@ -204,69 +211,169 @@ func (e *engine) recreateClean(ctx context.Context, name string) error {
 	return nil
 }
 
+// slotRe matches a slot builder's container or state volume; group 1 is the slot index, group 2 is
+// "" for the container and "_state" for its volume. buildx appends the node index (0) to the builder
+// name, so slot 1 is container ...-s10. The `<BUILDX_BUILDER>-s<n>` name space is RESERVED for this
+// agent's slots: another builder on the same daemon must not use it (it would be retired as surplus).
+func slotRe(base string) *regexp.Regexp {
+	return regexp.MustCompile("^buildx_buildkit_" + regexp.QuoteMeta(base) + `-s(\d+)0(_state)?$`)
+}
+
 // reconcileSlots runs once at startup, before any job is accepted: slot builders above the current
-// slot count (the operator lowered the ceiling or raised the slot size) are removed with their state
-// volume, so a smaller fleet does not leave unbounded cache volumes behind. Slots in range are left
-// alone; each is verified, and repaired, when a build acquires it.
+// slot count (the operator lowered the ceiling or raised the slot size) are retired with their state
+// volume, so a smaller fleet does not leave unbounded cache volumes behind. Containers AND volumes
+// are listed, so a volume orphaned by a half-finished retirement is found again; one failing slot does
+// not stop the others. Slots in range are left alone; each is verified, and repaired, when a build
+// acquires it.
 func (e *engine) reconcileSlots(ctx context.Context) error {
-	out, err := e.dockerRun(ctx, "ps", "-a", "--filter", "name=buildx_buildkit_"+e.cfg.Builder+"-s", "--format", "{{.Names}}")
+	prefix := "buildx_buildkit_" + e.cfg.Builder + "-s"
+	ps, err := e.dockerRun(ctx, "ps", "-a", "--filter", "name="+prefix, "--format", "{{.Names}}")
 	if err != nil {
-		return fmt.Errorf("list slot builders: %w: %s", err, out)
+		return fmt.Errorf("list slot builders: %w: %s", err, ps)
 	}
-	// buildx appends the node index (0) to the builder name: slot 1 is container ...-s10.
-	re := regexp.MustCompile("^buildx_buildkit_" + regexp.QuoteMeta(e.cfg.Builder) + `-s(\d+)0$`)
-	n := e.cfg.slotCount()
-	for _, c := range strings.Fields(out) {
-		m := re.FindStringSubmatch(c)
-		if m == nil {
-			continue
-		}
-		if idx, _ := strconv.Atoi(m[1]); idx >= n {
-			if err := e.recreateClean(ctx, slotBuilderName(e.cfg.Builder, idx)); err != nil {
-				return err
+	vols, err := e.dockerRun(ctx, "volume", "ls", "-q", "--filter", "name="+prefix)
+	if err != nil {
+		return fmt.Errorf("list slot volumes: %w: %s", err, vols)
+	}
+	re, n := slotRe(e.cfg.Builder), e.cfg.slotCount()
+	surplus := map[int]struct{}{}
+	for _, c := range strings.Fields(ps + "\n" + vols) {
+		if m := re.FindStringSubmatch(c); m != nil {
+			if idx, _ := strconv.Atoi(m[1]); idx >= n {
+				surplus[idx] = struct{}{}
 			}
 		}
 	}
-	return nil
+	var errs []error
+	for idx := range surplus {
+		if err := e.recreateClean(ctx, slotBuilderName(e.cfg.Builder, idx)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // ---- OOM detection ---------------------------------------------------------------------------------
 
-// oomKillCount reads oom_kill from the slot container's own cgroup (cgroup v2: the container sees its
-// cgroup as /sys/fs/cgroup, and memory.events is hierarchical, so it counts the kill of any RUN step).
-func (e *engine) oomKillCount(ctx context.Context, name string) (int64, bool) {
-	out, err := e.dockerRun(ctx, "exec", builderContainer(name), "cat", "/sys/fs/cgroup/memory.events")
-	if err != nil {
-		return 0, false
-	}
-	for _, l := range strings.Split(out, "\n") {
-		if k, v, ok := strings.Cut(strings.TrimSpace(l), " "); ok && k == "oom_kill" {
-			n, perr := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-			return n, perr == nil
-		}
-	}
-	return 0, false
+// slotProbe is what the agent knows about a slot's container at one instant.
+type slotProbe struct {
+	kills     int64 // oom_kill of the slot's own cgroup (hierarchical: counts a RUN step's kill)
+	haveKills bool  // read, and memory.max proved the file is the slot's own cgroup
+	startedAt string
+	haveStart bool
 }
 
-// buildOOMKilled reports whether the build that just failed on the slot was killed for memory: the
-// oom_kill counter moved while this build held the slot (exclusive, so the delta is its own), or, when
-// the container itself died and can no longer be read, docker recorded OOMKilled at or after the
-// build's start. A cancel or timeout also ends in exit 137 but moves neither, so it is not OOM.
-func (e *engine) buildOOMKilled(ctx context.Context, name string, before int64, haveBefore bool, started time.Time) bool {
-	if after, ok := e.oomKillCount(ctx, name); ok && haveBefore {
-		return after > before
+const probeTimeout = 10 * time.Second
+
+// readSlot reads the slot container's state and its cgroup v2 files in one inspect + one exec. The
+// container sees its cgroup as /sys/fs/cgroup; memory.max must equal the slot cap, otherwise the files
+// belong to a host cgroup namespace or cgroup v1 and the counters are not trusted (detection then
+// falls back to docker's own record instead of reporting a wrong "no kill").
+func (e *engine) readSlot(ctx context.Context, name string) slotProbe {
+	var p slotProbe
+	c := builderContainer(name)
+	if out, err := e.dockerRun(ctx, "inspect", "--format", "{{.State.Running}} {{.State.StartedAt}}", c); err == nil {
+		if f := strings.Fields(out); len(f) == 2 && f[0] == "true" {
+			p.startedAt, p.haveStart = f[1], true
+		}
+	}
+	out, err := e.dockerRun(ctx, "exec", c, "cat", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.events")
+	if err != nil {
+		return p
+	}
+	lines := strings.Split(out, "\n")
+	if strings.TrimSpace(lines[0]) != strconv.FormatInt(e.cfg.SlotMemory, 10) {
+		return p
+	}
+	for _, l := range lines[1:] {
+		k, v, ok := strings.Cut(strings.TrimSpace(l), " ")
+		n, perr := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if !ok || perr != nil {
+			continue
+		}
+		switch k {
+		case "oom_kill":
+			p.kills, p.haveKills = n, true
+		}
+	}
+	return p
+}
+
+// probeSlot is readSlot for the holder of a freshly acquired slot: a stopped container (an earlier
+// kill, a daemon restart) is started first so the counters can be read, and the read has its own
+// short timeout so a wedged container cannot eat the build's deadline.
+func (e *engine) probeSlot(ctx context.Context, name string) slotProbe {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	p := e.readSlot(ctx, name)
+	if !p.haveStart {
+		if _, err := e.dockerRun(ctx, "start", builderContainer(name)); err == nil {
+			p = e.readSlot(ctx, name)
+		}
+	}
+	return p
+}
+
+// buildOOMKilled reports whether the build that just failed on the slot was killed for memory. The
+// slot is exclusive, so everything that happened in its cgroup during the build is this build's:
+//   - the container restarted (new StartedAt): buildkitd, or the whole container, was killed and
+//     docker brought it back, which resets oom_kill and clears OOMKilled. Treated as an OOM kill.
+//   - else oom_kill moved: a RUN step was killed.
+//   - else (counters unreadable): docker's OOMKilled flag, if it was recorded after the build began.
+//
+// A cancel or timeout also ends in exit 137 but does none of these, so it is not OOM.
+func (e *engine) buildOOMKilled(ctx context.Context, name string, before slotProbe, started time.Time) (oom, restarted bool) {
+	after := e.readSlot(ctx, name)
+	if before.haveStart && after.haveStart && after.startedAt != before.startedAt {
+		return true, true
+	}
+	if before.haveKills && after.haveKills {
+		return after.kills > before.kills, false
 	}
 	out, err := e.dockerRun(ctx, "inspect", "--format", "{{.State.OOMKilled}} {{.State.FinishedAt}}", builderContainer(name))
 	f := strings.Fields(out)
 	if err != nil || len(f) != 2 || f[0] != "true" {
-		return false
+		return false, false
 	}
 	fin, perr := time.Parse(time.RFC3339Nano, f[1])
-	return perr == nil && !fin.Before(started)
+	return perr == nil && !fin.Before(started), false
+}
+
+// stepsRunning reports whether the slot still has a RUN step alive: BuildKit executes each one as a
+// `buildkit-runc ... run` child of buildkitd (measured on moby/buildkit: absent when idle, present for
+// the whole step). ok is false when the container cannot be asked.
+func (e *engine) stepsRunning(ctx context.Context, name string) (running, ok bool) {
+	out, err := e.dockerRun(ctx, "exec", builderContainer(name), "ps", "-o", "args")
+	if err != nil {
+		return false, false
+	}
+	return strings.Contains(out, "runc"), true
+}
+
+// waitIdle holds the slot until buildkitd has torn down the solve that just ended (a cancelled or
+// failed buildx client returns before the daemon is done), so the next holder never shares the cgroup
+// with a dying RUN step. Bounded; it gives up silently after the limit.
+func (e *engine) waitIdle(ctx context.Context, name string, limit time.Duration) {
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	for {
+		if running, ok := e.stepsRunning(ctx, name); !ok || !running {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // oomError is the failure a build gets when its slot's cgroup killed it.
-func (e *engine) oomError(cause error) error {
-	return fmt.Errorf("out of memory: the build exceeded its %dMiB slot limit (memory = memory-swap, killed by the kernel); reduce its memory use (e.g. Gradle workers, -Xmx) or ask the operator to raise BUILD_SLOT_MEMORY: %w",
-		e.cfg.SlotMemory>>20, cause)
+func (e *engine) oomError(cause error, restarted bool) error {
+	how := "killed by the kernel"
+	if restarted {
+		how = "its builder was killed and restarted, almost certainly by the kernel OOM killer"
+	}
+	return fmt.Errorf("out of memory: the build exceeded its %dMiB slot limit (memory = memory-swap, %s); reduce its memory use (e.g. Gradle workers, -Xmx) or ask the operator to raise BUILD_SLOT_MEMORY: %w",
+		e.cfg.SlotMemory>>20, how, cause)
 }

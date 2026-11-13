@@ -164,7 +164,6 @@ func (e *engine) ensureBuilder(ctx context.Context, b *Build, bld *builder) erro
 	}
 	recreate := os.Getenv("CC_RECREATE_BUILDER") == "1" && !bld.recreated
 	if storeOK && exists && capped && !recreate {
-		bld.ensured.Store(true)
 		b.appendLine("[builder] reusing " + name)
 		return nil
 	}
@@ -196,7 +195,6 @@ func (e *engine) ensureBuilder(ctx context.Context, b *Build, bld *builder) erro
 	if _, capped, err := e.containerState(ctx, name); err != nil || !capped {
 		return fmt.Errorf("builder %s was created but does not carry BUILD_SLOT_MEMORY (%d bytes, memory = memory-swap): %v", name, e.cfg.SlotMemory, err)
 	}
-	bld.ensured.Store(true)
 	b.appendLine("[builder] created " + name)
 	return nil
 }
@@ -207,20 +205,28 @@ func (e *engine) rotateTags(ctx context.Context, full string) {
 	}
 }
 
-// boundedGC prunes every slot builder that has been used. The size bounds are per builder, so the
+// boundedGC prunes every slot builder that exists on the daemon (derived from docker, not from what
+// this process happened to use, so a slot last used before a restart is still bounded). Each slot is
+// taken through the pool first, so a prune never overlaps a build's create/repair on it; a slot a
+// build holds is skipped and pruned by the next GC. The size bounds are per builder, so the
 // agent-wide totals (10GB reserved, 40GB max used) are split across the slots; min-free-space is a
 // host-disk floor and stays whole.
 func (e *engine) boundedGC(ctx context.Context) {
 	n := int64(max(len(e.sched.slots.builders), 1))
 	reserved, maxUsed := strconv.FormatInt(10<<30/n, 10), strconv.FormatInt(40<<30/n, 10)
-	for _, bld := range e.sched.slots.builders {
-		if !bld.ensured.Load() {
+	for i, bld := range e.sched.slots.builders {
+		if exists, _, err := e.containerState(ctx, bld.name); err != nil || !exists {
+			continue
+		}
+		_, free, ok := e.sched.slots.tryAcquireIdx(i)
+		if !ok {
 			continue
 		}
 		start := time.Now()
 		out, err := e.dockerRun(ctx, "buildx", "prune", "--builder", bld.name, "--force",
 			"--reserved-space", reserved, "--max-used-space", maxUsed, "--min-free-space", "20GB",
 			"--filter", "until=168h")
+		free()
 		// Always log the duration. This step cost one build 155.7 seconds while
 		// emitting nothing at all, so its only trace was a gap between two timestamps
 		// in a table nobody reads. A prune that starts taking minutes should be
@@ -266,19 +272,24 @@ func (e *engine) buildService(ctx context.Context, b *Build, bld *builder, d Des
 	if run == nil {
 		run = e.execBuildxDocker
 	}
-	// The slot is exclusively ours, so its cgroup's oom_kill counter moving during the build is OUR
-	// build being killed for memory: report it as such, not as a generic buildx failure.
+	// The slot is exclusively ours, so what happens in its cgroup during the build is OUR build:
+	// report a memory kill as such, not as a generic buildx failure.
 	started := time.Now()
-	oomBefore, haveBefore := e.oomKillCount(ctx, bld.name)
+	before := e.probeSlot(ctx, bld.name)
+	if !before.haveKills {
+		b.appendLine("[builder] warning: " + bld.name + " cgroup counters are unreadable; OOM detection falls back to docker's record")
+	}
 	if err := run(ctx, b, svc, args, b.workdir(), onLine); err != nil {
 		// A cancel or timeout also ends in 137 but is not OOM; ask on a fresh context otherwise.
+		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
 		if ctx.Err() == nil {
-			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			defer cancel()
-			if e.buildOOMKilled(qctx, bld.name, oomBefore, haveBefore, started) {
-				return serviceResult{}, e.oomError(err)
+			if oom, restarted := e.buildOOMKilled(qctx, bld.name, before, started); oom {
+				return serviceResult{}, e.oomError(err, restarted)
 			}
 		}
+		// buildkitd tears a failed or cancelled solve down asynchronously: keep the slot until it has.
+		e.waitIdle(qctx, bld.name, 20*time.Second)
 		return serviceResult{}, err
 	}
 	// The versioned tag was pushed by the build itself (see buildxArgs), so it cannot point at

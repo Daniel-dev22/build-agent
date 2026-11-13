@@ -50,15 +50,28 @@ func TestValidateMemoryHasNoUncappedMode(t *testing.T) {
 		"no ceiling":         {},
 		"no slot":            {MemoryCeiling: 8 * gib},
 		"slot above ceiling": {MemoryCeiling: 4 * gib, SlotMemory: 8 * gib},
+		"unitless typo":      {MemoryCeiling: gib, SlotMemory: 4},
+		"below minimum":      {MemoryCeiling: gib, SlotMemory: 64 << 20},
 		"negative slot":      {MemoryCeiling: 4 * gib, SlotMemory: -1},
 	} {
 		if err := c.validateMemory(); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
-	c := Config{MemoryCeiling: 9 * gib, SlotMemory: 4 * gib}
+	c := Config{MemoryCeiling: 9 * gib, SlotMemory: 4 * gib, FastLane: 4, SlowLane: 4}
 	if err := c.validateMemory(); err != nil || c.slotCount() != 2 {
 		t.Fatalf("9g/4g: err=%v slots=%d (floor, never over-commit)", err, c.slotCount())
+	}
+}
+
+// Slots beyond fast+slow lanes can never be occupied: 100 GiB / 256 MiB must not mean 400 builders.
+func TestSlotCountIsCappedAtTheLanes(t *testing.T) {
+	c := Config{MemoryCeiling: 100 * gib, SlotMemory: 256 << 20, FastLane: 2, SlowLane: 1}
+	if err := c.validateMemory(); err != nil || c.slotCount() != 3 {
+		t.Fatalf("err=%v slots=%d, want 3 (fast+slow)", err, c.slotCount())
+	}
+	if n := (Config{MemoryCeiling: gib, SlotMemory: gib}).slotCount(); n != 1 {
+		t.Fatalf("one slot, got %d", n)
 	}
 }
 
@@ -93,6 +106,8 @@ type fakeHost struct {
 	calls            []string
 	createIgnoresCap bool // buildx create never applies the opts (even on a fresh container)
 	psOut            string
+	volOut           string
+	volRmFails       map[string]bool
 }
 
 func (h *fakeHost) fn(_ context.Context, args ...string) (string, error) {
@@ -113,7 +128,12 @@ func (h *fakeHost) fn(_ context.Context, args ...string) (string, error) {
 		return strconv.FormatInt(h.mem, 10) + " " + strconv.FormatInt(h.swap, 10), nil
 	case args[0] == "rm" && args[1] == "-f":
 		h.exists = false
+	case args[0] == "volume" && args[1] == "ls":
+		return h.volOut, nil
 	case args[0] == "volume" && args[1] == "rm":
+		if h.volRmFails[args[2]] {
+			return "boom", errors.New("exit 1")
+		}
 		h.volumeRm++
 	case strings.HasPrefix(line, "buildx rm"):
 		// A real daemon: removing a builder that is not in the store fails, and it never touches a
@@ -282,31 +302,60 @@ func TestRecreateEnvActsOnTheContainerWhenTheStoreIsLost(t *testing.T) {
 
 // Lowering the slot count must not leave a builder container and an unbounded state volume behind.
 func TestReconcileRetiresOnlySurplusSlotsWithTheirVolume(t *testing.T) {
-	h := &fakeHost{psOut: "buildx_buildkit_b-s10\nbuildx_buildkit_b-s20\nbuildx_buildkit_b-s30\nbuildx_buildkit_b-sx0\nother"}
+	h := &fakeHost{psOut: "buildx_buildkit_b0\nbuildx_buildkit_b-s10\nbuildx_buildkit_b-s20\nbuildx_buildkit_b-s30\nbuildx_buildkit_b-sx0\nbuildx_buildkit_b-s1-x0\nother"}
 	e := hostEngine(h) // 8g / 4g = 2 slots: 0 and 1 stay, 2 and 3 go
+	e.cfg.FastLane, e.cfg.SlowLane = 4, 4
 	if err := e.reconcileSlots(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if h.did("rm -f buildx_buildkit_b-s10") || h.did("volume rm buildx_buildkit_b-s10_state") {
-		t.Fatalf("slot 1 is in range and must stay: %v", h.calls)
+	if h.did("rm -f buildx_buildkit_b-s10") || h.did("volume rm buildx_buildkit_b-s10_state") || h.did("rm -f buildx_buildkit_b0") || h.did("volume rm buildx_buildkit_b0_state") {
+		t.Fatalf("slots 0 and 1 are in range and must stay: %v", h.calls)
 	}
 	for _, c := range []string{"rm -f buildx_buildkit_b-s20", "volume rm buildx_buildkit_b-s20_state", "rm -f buildx_buildkit_b-s30", "volume rm buildx_buildkit_b-s30_state"} {
 		if !h.did(c) {
 			t.Errorf("missing %q in %v", c, h.calls)
 		}
 	}
-	if h.did("b-sx0") || h.did("other") {
+	if h.did("b-sx0") || h.did("b-s1-x0") || h.did("other") {
 		t.Fatalf("unrelated containers must not be touched: %v", h.calls)
+	}
+}
+
+// A volume whose container is already gone (half-finished retirement, a container prune) is found by
+// the volume listing and removed; one slot failing does not stop the next.
+func TestReconcileRemovesOrphanVolumesAndSurvivesAFailingSlot(t *testing.T) {
+	h := &fakeHost{
+		volOut:     "buildx_buildkit_b-s20_state\nbuildx_buildkit_b-s30_state\nbuildx_buildkit_b-s10_state\nbuildx_buildkit_b0_state",
+		volRmFails: map[string]bool{"buildx_buildkit_b-s20_state": true},
+	}
+	e := hostEngine(h)
+	e.cfg.FastLane, e.cfg.SlowLane = 4, 4
+	err := e.reconcileSlots(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "state volume") {
+		t.Fatalf("the failing slot must be reported: %v", err)
+	}
+	if !h.did("volume rm buildx_buildkit_b-s30_state") {
+		t.Fatalf("a failure on slot 2 must not skip slot 3: %v", h.calls)
+	}
+	if h.did("buildx_buildkit_b-s10_state") || h.did("buildx_buildkit_b0_state") {
+		t.Fatalf("in-range volumes must stay: %v", h.calls)
 	}
 }
 
 // ---- OOM reporting ---------------------------------------------------------------------------------
 
+// oomHost models a slot container: memory.max/memory.events as cgroup v2 shows them inside it, a
+// StartedAt that changes when docker restarts it, and docker's sticky OOMKilled flag.
 type oomHost struct {
-	mu     sync.Mutex
-	kills  int64
-	execOK bool   // the container is readable
-	state  string // reply to the OOMKilled inspect
+	mu        sync.Mutex
+	kills     int64
+	execOK    bool   // the container is readable
+	maxLine   string // memory.max as the container sees it ("" = the slot cap)
+	startedAt string
+	running   bool
+	oomState  string // reply to the OOMKilled inspect
+	runc      bool   // a RUN step is alive
+	starts    int
 }
 
 func (o *oomHost) fn(_ context.Context, args ...string) (string, error) {
@@ -317,62 +366,150 @@ func (o *oomHost) fn(_ context.Context, args ...string) (string, error) {
 		if !o.execOK {
 			return "Error: container is not running", errors.New("exit 1")
 		}
-		return fmt.Sprintf("low 0\nhigh 0\nmax 5\noom 1\noom_kill %d\noom_group_kill 0", o.kills), nil
+		if args[2] == "ps" {
+			if o.runc {
+				return "buildkitd\nbuildkit-runc --log x run --bundle y", nil
+			}
+			return "buildkitd", nil
+		}
+		max := o.maxLine
+		if max == "" {
+			max = strconv.FormatInt(slotCap, 10)
+		}
+		return fmt.Sprintf("%s\nlow 0\nhigh 0\nmax 5\noom 1\noom_kill %d\noom_group_kill 0", max, o.kills), nil
+	case "start":
+		o.starts++
+		o.running, o.execOK = true, true
+		return "", nil
 	case "inspect":
-		if strings.Contains(strings.Join(args, " "), "OOMKilled") {
-			return o.state, nil
+		f := strings.Join(args, " ")
+		switch {
+		case strings.Contains(f, "OOMKilled"):
+			return o.oomState, nil
+		case strings.Contains(f, "State.Running"):
+			if !o.running {
+				return "false " + o.startedAt, nil
+			}
+			return "true " + o.startedAt, nil
 		}
 		return strconv.FormatInt(slotCap, 10) + " " + strconv.FormatInt(slotCap, 10), nil
 	}
 	return "", nil
 }
 
+func newOOMHost() *oomHost {
+	return &oomHost{execOK: true, running: true, startedAt: "2026-11-13T10:00:00Z"}
+}
+
 func oomEngine(o *oomHost) *engine {
-	e := &engine{cfg: Config{Builder: "b", MemoryCeiling: 8 << 30, SlotMemory: slotCap}, docker: o.fn}
+	e := &engine{cfg: Config{Builder: "b", MemoryCeiling: 8 << 30, SlotMemory: slotCap, FastLane: 2, SlowLane: 1}, docker: o.fn}
 	e.sched = newScheduler(e.cfg)
 	return e
 }
 
 func TestOOMKillCounterDeltaIsReportedAsOOM(t *testing.T) {
-	o := &oomHost{execOK: true, kills: 3}
+	o := newOOMHost()
+	o.kills = 3
 	e := oomEngine(o)
-	before, ok := e.oomKillCount(context.Background(), "b")
-	if !ok || before != 3 {
-		t.Fatalf("parse oom_kill: %d %v", before, ok)
+	before := e.probeSlot(context.Background(), "b")
+	if !before.haveKills || before.kills != 3 {
+		t.Fatalf("parse oom_kill: %+v", before)
 	}
-	if e.buildOOMKilled(context.Background(), "b", before, ok, time.Now()) {
+	if oom, _ := e.buildOOMKilled(context.Background(), "b", before, time.Now()); oom {
 		t.Fatal("no kill during the build (a plain failure, a cancel, a timeout) is not OOM")
 	}
 	o.kills = 4
-	if !e.buildOOMKilled(context.Background(), "b", before, ok, time.Now()) {
-		t.Fatal("oom_kill moved during the build: that is an OOM")
+	if oom, restarted := e.buildOOMKilled(context.Background(), "b", before, time.Now()); !oom || restarted {
+		t.Fatalf("oom_kill moved during the build: that is an OOM (restarted=%v)", restarted)
 	}
 }
 
-// buildkitd itself was the victim: the container cannot be exec'd, docker's own record decides.
-func TestOOMFallsBackToInspectWhenTheContainerDied(t *testing.T) {
-	started := time.Now()
-	o := &oomHost{execOK: false, state: "true " + started.Add(time.Second).UTC().Format(time.RFC3339Nano)}
+// The M4 case: buildkitd was the victim and docker restarted the container. oom_kill is back at 0
+// (so a delta says "no kill") and OOMKilled is cleared; the new StartedAt is the evidence.
+func TestRestartedBuilderDuringABuildIsReportedAsOOM(t *testing.T) {
+	o := newOOMHost()
+	o.kills = 5
 	e := oomEngine(o)
-	if !e.buildOOMKilled(context.Background(), "b", 0, false, started) {
-		t.Fatal("OOMKilled finished after the build started is an OOM")
+	before := e.probeSlot(context.Background(), "b")
+	o.kills, o.startedAt, o.oomState = 0, "2026-11-13T10:07:00Z", "false 0001-01-01T00:00:00Z"
+	oom, restarted := e.buildOOMKilled(context.Background(), "b", before, time.Now())
+	if !oom || !restarted {
+		t.Fatalf("a builder restarted mid-build must read as OOM-suspect: oom=%v restarted=%v", oom, restarted)
 	}
-	o.state = "true " + started.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
-	if e.buildOOMKilled(context.Background(), "b", 0, false, started) {
+	if err := e.oomError(errors.New("x"), true); !strings.Contains(err.Error(), "restarted") {
+		t.Fatalf("%v", err)
+	}
+}
+
+// A stopped container at acquire time is started so its counters can be read (case b).
+func TestProbeStartsAStoppedSlotContainer(t *testing.T) {
+	o := newOOMHost()
+	o.running, o.execOK = false, false
+	e := oomEngine(o)
+	p := e.probeSlot(context.Background(), "b")
+	if o.starts != 1 || !p.haveKills || !p.haveStart {
+		t.Fatalf("starts=%d probe=%+v", o.starts, p)
+	}
+}
+
+// Under a host cgroup namespace or cgroup v1 the files are not the slot's: memory.max does not match,
+// the counters are NOT trusted (never a false "no kill"), and docker's own record decides.
+func TestForeignCgroupCountersAreNotTrusted(t *testing.T) {
+	started := time.Now()
+	o := newOOMHost()
+	o.maxLine = "max"
+	e := oomEngine(o)
+	before := e.probeSlot(context.Background(), "b")
+	if before.haveKills {
+		t.Fatal("memory.max != slot cap: counters must be distrusted")
+	}
+	o.running = false
+	o.oomState = "true " + started.Add(time.Second).UTC().Format(time.RFC3339Nano)
+	if oom, _ := e.buildOOMKilled(context.Background(), "b", before, started); !oom {
+		t.Fatal("OOMKilled recorded after the build began is an OOM")
+	}
+	o.oomState = "true " + started.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	if oom, _ := e.buildOOMKilled(context.Background(), "b", before, started); oom {
 		t.Fatal("a stale OOMKilled from before this build must not be blamed on it")
 	}
-	o.state = "false 2026-01-01T00:00:00Z"
-	if e.buildOOMKilled(context.Background(), "b", 0, false, started) {
+	o.oomState = "false 2026-01-01T00:00:00Z"
+	if oom, _ := e.buildOOMKilled(context.Background(), "b", before, started); oom {
 		t.Fatal("OOMKilled=false is not an OOM")
 	}
 }
 
 func TestOOMErrorNamesTheLimitAndKeepsTheCause(t *testing.T) {
-	e := oomEngine(&oomHost{})
+	e := oomEngine(newOOMHost())
 	cause := errors.New("exit status 1")
-	err := e.oomError(cause)
+	err := e.oomError(cause, false)
 	if !strings.Contains(err.Error(), "out of memory") || !strings.Contains(err.Error(), "4096MiB") || !errors.Is(err, cause) {
 		t.Fatalf("%v", err)
+	}
+}
+
+// The slot is held until buildkitd has torn the dying solve down (L3), bounded.
+func TestWaitIdleHoldsUntilNoStepIsRunningAndIsBounded(t *testing.T) {
+	o := newOOMHost()
+	o.runc = true
+	e := oomEngine(o)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		o.mu.Lock()
+		o.runc = false
+		o.mu.Unlock()
+	}()
+	start := time.Now()
+	e.waitIdle(context.Background(), "b", 5*time.Second)
+	if d := time.Since(start); d < 250*time.Millisecond || d > 3*time.Second {
+		t.Fatalf("waited %v for a step that ended at 300ms", d)
+	}
+	o.mu.Lock()
+	o.runc = true
+	o.mu.Unlock()
+	start = time.Now()
+	e.waitIdle(context.Background(), "b", 400*time.Millisecond)
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("waitIdle must give up at its limit")
 	}
 }
 
@@ -380,17 +517,20 @@ func TestOOMErrorNamesTheLimitAndKeepsTheCause(t *testing.T) {
 // failure with no kill (or a cancelled build) stays a generic error.
 func TestBuildServiceReportsOOMOnlyWhenTheSlotCgroupKilled(t *testing.T) {
 	d := Descriptor{Project: "p", Services: []ServiceSpec{{Name: "a", Dockerfile: "Dockerfile"}}}
-	run := func(kill, cancel bool) error {
-		o := &oomHost{execOK: true}
+	run := func(kill, restart, cancel bool) error {
+		o := newOOMHost()
 		e := oomEngine(o)
 		ctx, cancelFn := context.WithCancel(context.Background())
 		defer cancelFn()
 		e.execBuildx = func(context.Context, *Build, ServiceSpec, []string, string, func(string)) error {
+			o.mu.Lock()
 			if kill {
-				o.mu.Lock()
 				o.kills++
-				o.mu.Unlock()
 			}
+			if restart {
+				o.kills, o.startedAt = 0, "2026-11-13T11:00:00Z"
+			}
+			o.mu.Unlock()
 			if cancel {
 				cancelFn()
 			}
@@ -401,45 +541,98 @@ func TestBuildServiceReportsOOMOnlyWhenTheSlotCgroupKilled(t *testing.T) {
 		_, err := e.buildService(ctx, b, slot0(e), d, d.Services[0], "127.0.0.1:1", "v", "a", "", provenance{}, false, 1, nil, buildExtras{})
 		return err
 	}
-	if err := run(true, false); err == nil || !strings.Contains(err.Error(), "out of memory") {
+	if err := run(true, false, false); err == nil || !strings.Contains(err.Error(), "out of memory") {
 		t.Fatalf("a kill during the build must read as OOM: %v", err)
 	}
-	if err := run(false, false); err == nil || strings.Contains(err.Error(), "out of memory") {
+	if err := run(false, true, false); err == nil || !strings.Contains(err.Error(), "out of memory") {
+		t.Fatalf("a restart during the build must read as OOM: %v", err)
+	}
+	if err := run(false, false, false); err == nil || strings.Contains(err.Error(), "out of memory") {
 		t.Fatalf("a plain failure must not read as OOM: %v", err)
 	}
-	if err := run(true, true); err == nil || strings.Contains(err.Error(), "out of memory") {
+	if err := run(true, true, true); err == nil || strings.Contains(err.Error(), "out of memory") {
 		t.Fatalf("a cancelled build (also 137) must not read as OOM: %v", err)
 	}
 }
 
 // ---- GC across slots --------------------------------------------------------------------------------
 
-func TestBoundedGCPrunesEveryUsedSlotWithSplitBounds(t *testing.T) {
+// GC is derived from docker (slot containers that exist), not from what this process used, and a slot
+// a build holds is skipped so a prune never overlaps its create/repair.
+func TestBoundedGCPrunesEveryExistingFreeSlotWithSplitBounds(t *testing.T) {
 	var mu sync.Mutex
 	var prunes []string
+	existing := map[string]bool{"buildx_buildkit_b0": true}
 	e := newRunEngine(t, Config{FastLane: 2, SlowLane: 1, MemoryCeiling: 8 * gib, SlotMemory: 4 * gib})
 	e.docker = func(_ context.Context, args ...string) (string, error) {
-		if args[0] == "buildx" && args[1] == "prune" {
-			mu.Lock()
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case args[0] == "inspect":
+			if !existing[args[len(args)-1]] {
+				return "Error: No such object", errors.New("exit 1")
+			}
+			return strconv.FormatInt(e.cfg.SlotMemory, 10) + " " + strconv.FormatInt(e.cfg.SlotMemory, 10), nil
+		case args[0] == "buildx" && args[1] == "prune":
 			prunes = append(prunes, strings.Join(args, " "))
-			mu.Unlock()
 		}
 		return "", nil
 	}
-	e.sched.slots.builders[0].ensured.Store(true)
+	// A freshly restarted agent: nothing has been ensured in this process, yet slot 0 exists.
 	e.boundedGC(context.Background())
 	if len(prunes) != 1 || !strings.Contains(prunes[0], "--builder b ") {
-		t.Fatalf("only a used slot is pruned: %v", prunes)
+		t.Fatalf("an existing slot is pruned after a restart; a missing one is not: %v", prunes)
 	}
-	e.sched.slots.builders[1].ensured.Store(true)
+	existing["buildx_buildkit_b-s10"] = true
+	prunes = nil
+	_, rel, _ := e.sched.slots.tryAcquireIdx(0) // a build holds slot 0
+	e.boundedGC(context.Background())
+	if len(prunes) != 1 || !strings.Contains(prunes[0], "--builder b-s1 ") {
+		t.Fatalf("a held slot must be skipped: %v", prunes)
+	}
+	rel()
 	prunes = nil
 	e.boundedGC(context.Background())
-	if len(prunes) != 2 || !strings.Contains(prunes[1], "--builder b-s1 ") {
-		t.Fatalf("every used slot is pruned: %v", prunes)
+	if len(prunes) != 2 {
+		t.Fatalf("every existing free slot: %v", prunes)
 	}
 	for _, p := range prunes {
 		if !strings.Contains(p, "--max-used-space "+strconv.FormatInt(20<<30, 10)) || !strings.Contains(p, "--reserved-space "+strconv.FormatInt(5<<30, 10)) {
 			t.Fatalf("the 40GB/10GB totals must be split across 2 slots: %s", p)
+		}
+	}
+	if _, _, ok := e.sched.slots.tryAcquireIdx(0); !ok {
+		t.Fatal("GC must release the slot it took")
+	}
+}
+
+// ensureBuilder is only ever called by the holder of a slot: nothing may create/repair/recreate a
+// builder before admission has granted the slot (this replaces the old "only when idle" tests).
+func TestBuilderIsEnsuredOnlyWhileTheSlotIsHeld(t *testing.T) {
+	e := newRunEngine(t, Config{FastLane: 2, SlowLane: 1, MemoryCeiling: 8 * gib, SlotMemory: 4 * gib})
+	var mu sync.Mutex
+	var heldAtEnsure []bool
+	inner := fakeDocker(e.cfg)
+	e.docker = func(ctx context.Context, args ...string) (string, error) {
+		if args[0] == "buildx" && args[1] == "inspect" {
+			e.sched.slots.mu.Lock()
+			held := e.sched.slots.busy[0] || e.sched.slots.busy[1]
+			e.sched.slots.mu.Unlock()
+			mu.Lock()
+			heldAtEnsure = append(heldAtEnsure, held)
+			mu.Unlock()
+		}
+		return inner(ctx, args...)
+	}
+	e.execBuildx = fakeBuildx(nil)
+	d := Descriptor{Project: "p", Services: []ServiceSpec{{Name: "a", Dockerfile: "Dockerfile"}, {Name: "b", Dockerfile: "Dockerfile"}}}
+	runJob(t, e, d, BuildRequest{})
+	if len(heldAtEnsure) != 2 {
+		t.Fatalf("one ensure per service, got %d", len(heldAtEnsure))
+	}
+	for _, h := range heldAtEnsure {
+		if !h {
+			t.Fatal("ensureBuilder ran without a held slot")
 		}
 	}
 }

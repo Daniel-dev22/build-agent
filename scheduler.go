@@ -71,6 +71,17 @@ func (s *weightedSem) acquire(ctx context.Context, n int64) error {
 	}
 }
 
+// tryAcquire takes n units only if that needs no waiting at all (and nobody is queued ahead).
+func (s *weightedSem) tryAcquire(n int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.waiters.Len() > 0 || s.used+n > s.size {
+		return false
+	}
+	s.used += n
+	return true
+}
+
 func (s *weightedSem) release(n int64) {
 	if n <= 0 {
 		return
@@ -125,15 +136,32 @@ func (p *slotPool) acquire(ctx context.Context) (*builder, func(), error) {
 	idx := slices.Index(p.busy, false) // the semaphore guarantees one is free
 	p.busy[idx] = true
 	p.mu.Unlock()
+	return p.builders[idx], p.releaser(idx), nil
+}
+
+func (p *slotPool) releaser(idx int) func() {
 	var once sync.Once
-	return p.builders[idx], func() {
+	return func() {
 		once.Do(func() {
 			p.mu.Lock()
 			p.busy[idx] = false
 			p.mu.Unlock()
 			p.sem.release(1)
 		})
-	}, nil
+	}
+}
+
+// tryAcquireIdx takes slot idx only if it is free right now; the builder GC uses it so a prune never
+// touches a slot a build holds.
+func (p *slotPool) tryAcquireIdx(idx int) (*builder, func(), bool) {
+	p.mu.Lock()
+	if p.busy[idx] || !p.sem.tryAcquire(1) {
+		p.mu.Unlock()
+		return nil, nil, false
+	}
+	p.busy[idx] = true
+	p.mu.Unlock()
+	return p.builders[idx], p.releaser(idx), true
 }
 
 // scheduler owns the agent-wide limits: one semaphore per lane and the pool of memory-capped build
