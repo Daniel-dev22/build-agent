@@ -37,6 +37,14 @@ type Config struct {
 	GitTimeout           time.Duration // per-clone timeout
 	BuildTimeout         time.Duration // hard ceiling per build job
 
+	// MemoryCeiling (BUILD_MEMORY_CEILING, e.g. "7g") is the hard memory cap on the persistent
+	// BuildKit builder (memory = memory-swap) AND the budget that per-service manifest `memory`
+	// reservations are admitted against. 0 = unset: no cap, no reservations (previous behaviour).
+	MemoryCeiling int64
+	// MemoryDefault (BUILD_MEMORY_DEFAULT, default "1g") is the reservation charged to a service
+	// whose manifest sets no `memory`. Only meaningful when a ceiling is set.
+	MemoryDefault int64
+
 	// PrivateRepoOwners lists GitHub owners/orgs whose repos are treated as
 	// private (⇒ vend an installation token) when BuildRequest.Private is unset.
 	// Empty (the default) ⇒ nothing is inferred private.
@@ -70,6 +78,8 @@ func loadConfig() Config {
 		BuildTimeout:         getEnvDuration("BUILD_TIMEOUT", 60*time.Minute),
 		PrivateRepoOwners:    getEnvList("PRIVATE_REPO_OWNERS"),
 	}
+	cfg.MemoryCeiling = requireBytes("BUILD_MEMORY_CEILING", "")
+	cfg.MemoryDefault = requireBytes("BUILD_MEMORY_DEFAULT", "1g")
 	tok, err := readBearerToken(cfg.BearerTokenFile)
 	if err != nil {
 		slog.Error("bearer token unreadable — cannot authenticate to controller",
@@ -133,6 +143,18 @@ func getEnvInt(k string, def int) int {
 	if err != nil {
 		slog.Warn("invalid int env var, using default", "var", k, "value", v, "default", def)
 		return def
+	}
+	return n
+}
+
+// requireBytes parses a size env var. A malformed value is fatal, unlike getEnvInt's fallback:
+// silently falling back here would run builds with NO memory cap on a host the cap exists to protect.
+func requireBytes(k, def string) int64 {
+	v := getEnv(k, def)
+	n, err := parseBytes(v)
+	if err != nil {
+		slog.Error("invalid size env var", "var", k, "value", v, "error", err)
+		os.Exit(1)
 	}
 	return n
 }

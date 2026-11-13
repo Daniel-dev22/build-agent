@@ -29,6 +29,14 @@ func (a *app) handleTriggerBuild(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "descriptor." + err.Error()})
 		return
 	}
+	if err := req.Descriptor.checkMemory(a.cfg.MemoryCeiling); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "descriptor." + err.Error()})
+		return
+	}
+	if err := validateContextRefs(req.Descriptor.Contexts, req.ContextRefs); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if req.Registry == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "registry is required"})
 		return

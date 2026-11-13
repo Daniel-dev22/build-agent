@@ -177,11 +177,31 @@ func (r *registryClient) pruneOldTags(ctx context.Context, registry, image strin
 		return
 	}
 	stale := candidates[keep:]
+	// A registry DELETE is by DIGEST, and tags that point at identical content share one. A rebuild
+	// that changes nothing (same layers, same labels) pushes a NEW timestamp tag onto the SAME digest,
+	// so deleting a stale tag's digest would also delete the newer tag(s) — and :latest/:stable —
+	// that still reference it. Digests held by any kept or protected tag are therefore never deleted.
+	live := map[string]struct{}{}
+	for _, t := range candidates[:keep] {
+		if d := r.resolveDigest(ctx, base, t); d != "" {
+			live[d] = struct{}{}
+		}
+	}
+	for _, t := range tl.Tags {
+		if _, prot := protectedTags[t]; prot {
+			if d := r.resolveDigest(ctx, base, t); d != "" {
+				live[d] = struct{}{}
+			}
+		}
+	}
 	seen := map[string]struct{}{}
 	deleted := 0
 	for _, t := range stale {
 		d := r.resolveDigest(ctx, base, t)
 		if d == "" {
+			continue
+		}
+		if _, held := live[d]; held {
 			continue
 		}
 		if _, dup := seen[d]; dup {
