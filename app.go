@@ -29,12 +29,11 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		return nil, fmt.Errorf("event buffer: %w", err)
 	}
 	eng := newEngine(cfg, cc)
-	// Before any job is accepted: a builder created under an older (or no) memory ceiling is
-	// removed here (state kept) so the next job recreates it capped. Nothing is building yet, which
-	// is the only moment that is safe. Not fatal: if docker is unreachable no build can run anyway,
-	// and ensureBuilder refuses to use an uncapped builder, so the cap is never silently skipped.
-	if err := eng.reconcileBuilder(ctx); err != nil {
-		slog.Error("builder memory-cap reconcile failed; builds will be refused until it succeeds", "error", err)
+	// Before any job is accepted: slot builders above the current slot count are retired with their
+	// state volume. Not fatal: if docker is unreachable no build can run anyway, and every slot's cap
+	// is verified (and repaired) when a build acquires it, so the cap is never silently skipped.
+	if err := eng.reconcileSlots(ctx); err != nil {
+		slog.Error("slot builder reconcile failed", "error", err)
 	}
 	reg := newBuildRegistry(cfg, eng, events)
 	reg.setHook(events.handleJobEvent)

@@ -4,8 +4,8 @@ import (
 	"container/list"
 	"context"
 	"fmt"
+	"slices"
 	"sync"
-	"sync/atomic"
 )
 
 // Agent-wide admission control.
@@ -98,25 +98,61 @@ func (s *weightedSem) grantLocked() {
 	}
 }
 
-// scheduler owns the agent-wide limits: one semaphore per lane and, when a memory ceiling is
-// configured, one weighted semaphore whose capacity is that ceiling.
+// slotPool hands out build slots (one capped BuildKit builder each). A weightedSem of size N gives
+// FIFO fairness and ctx cancellation; the free set picks the LOWEST free index so serial builds keep
+// hitting slot 0's warm cache mounts.
+type slotPool struct {
+	sem      *weightedSem
+	mu       sync.Mutex
+	builders []*builder
+	busy     []bool
+}
+
+func newSlotPool(cfg Config) *slotPool {
+	n := cfg.slotCount()
+	p := &slotPool{sem: newWeightedSem(int64(n)), builders: make([]*builder, n), busy: make([]bool, n)}
+	for i := range p.builders {
+		p.builders[i] = &builder{idx: i, name: slotBuilderName(cfg.Builder, i)}
+	}
+	return p
+}
+
+func (p *slotPool) acquire(ctx context.Context) (*builder, func(), error) {
+	if err := p.sem.acquire(ctx, 1); err != nil {
+		return nil, nil, err
+	}
+	p.mu.Lock()
+	idx := slices.Index(p.busy, false) // the semaphore guarantees one is free
+	p.busy[idx] = true
+	p.mu.Unlock()
+	return p.builders[idx], p.releaser(idx), nil
+}
+
+func (p *slotPool) releaser(idx int) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			p.busy[idx] = false
+			p.mu.Unlock()
+			p.sem.release(1)
+		})
+	}
+}
+
+// scheduler owns the agent-wide limits: one semaphore per lane and the pool of memory-capped build
+// slots. The caps of all slots sum to at most BUILD_MEMORY_CEILING, so nothing can over-commit it.
 type scheduler struct {
 	fast, slow *weightedSem
-	mem        *weightedSem // nil when no ceiling is configured
-	memDefault int64
-	running    atomic.Int32 // services currently admitted (inside buildx)
+	slots      *slotPool
 }
 
 func newScheduler(cfg Config) *scheduler {
-	s := &scheduler{
-		fast: newWeightedSem(int64(max(cfg.FastLane, 1))),
-		slow: newWeightedSem(int64(max(cfg.SlowLane, 1))),
+	return &scheduler{
+		fast:  newWeightedSem(int64(max(cfg.FastLane, 1))),
+		slow:  newWeightedSem(int64(max(cfg.SlowLane, 1))),
+		slots: newSlotPool(cfg),
 	}
-	if cfg.MemoryCeiling > 0 {
-		s.mem = newWeightedSem(cfg.MemoryCeiling)
-		s.memDefault = cfg.MemoryDefault
-	}
-	return s
 }
 
 // runLimits is the per-job refinement of the agent-wide lane limits. A descriptor's lanes.fast/slow
@@ -137,21 +173,11 @@ func (s *scheduler) limitsFor(d Descriptor) runLimits {
 	return rl
 }
 
-// weight is the memory reservation a service is charged: its own `memory`, else the agent default.
-func (s *scheduler) weight(svc ServiceSpec) int64 {
-	if s.mem == nil {
-		return 0
-	}
-	if n, err := parseBytes(svc.Memory); err == nil && n > 0 {
-		return n
-	}
-	return s.memDefault
-}
-
 // admit blocks until the service may start: a per-job lane slot (if the descriptor lowered it), then
-// the agent-wide lane slot, then its memory reservation. The returned release must be called once.
-// Order is fixed (lane before memory) so two waiters can never hold what the other needs.
-func (s *scheduler) admit(ctx context.Context, rl runLimits, svc ServiceSpec) (func(), error) {
+// the agent-wide lane slot, then a build slot. Returns the slot's builder, which the caller owns
+// exclusively until it calls the release (once). Order is fixed (lane before slot) so two waiters can
+// never hold what the other needs.
+func (s *scheduler) admit(ctx context.Context, rl runLimits, svc ServiceSpec) (*builder, func(), error) {
 	lane, local := s.fast, rl.fast
 	if svc.lane() == "slow" {
 		lane, local = s.slow, rl.slow
@@ -162,30 +188,22 @@ func (s *scheduler) admit(ctx context.Context, rl runLimits, svc ServiceSpec) (f
 			undo[i]()
 		}
 	}
-	take := func(sem *weightedSem, n int64) error {
-		if sem == nil || n <= 0 {
-			return nil
+	for _, sem := range []*weightedSem{local, lane} {
+		if sem == nil {
+			continue
 		}
-		if err := sem.acquire(ctx, n); err != nil {
-			return err
+		if err := sem.acquire(ctx, 1); err != nil {
+			release()
+			return nil, nil, err
 		}
-		undo = append(undo, func() { sem.release(n) })
-		return nil
+		undo = append(undo, func() { sem.release(1) })
 	}
-	if err := take(local, 1); err != nil {
+	bld, freeSlot, err := s.slots.acquire(ctx)
+	if err != nil {
 		release()
-		return nil, err
+		return nil, nil, fmt.Errorf("build slot: %w", err)
 	}
-	if err := take(lane, 1); err != nil {
-		release()
-		return nil, err
-	}
-	if err := take(s.mem, s.weight(svc)); err != nil {
-		release()
-		return nil, fmt.Errorf("memory reservation: %w", err)
-	}
-	s.running.Add(1)
-	inner := release
+	undo = append(undo, freeSlot)
 	var once sync.Once
-	return func() { once.Do(func() { s.running.Add(-1); inner() }) }, nil
+	return bld, func() { once.Do(release) }, nil
 }

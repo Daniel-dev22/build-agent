@@ -57,11 +57,11 @@ func fakeBuildx(hook func(svc ServiceSpec, args []string)) func(context.Context,
 	}
 }
 
-// fakeDocker answers every docker call as a healthy host whose builder already carries the ceiling.
+// fakeDocker answers every docker call as a healthy host whose slot builders already carry the cap.
 func fakeDocker(cfg Config) func(context.Context, ...string) (string, error) {
 	return func(_ context.Context, args ...string) (string, error) {
 		if len(args) > 0 && args[0] == "inspect" {
-			c := strconv.FormatInt(cfg.MemoryCeiling, 10)
+			c := strconv.FormatInt(cfg.SlotMemory, 10)
 			return c + " " + c, nil
 		}
 		return "", nil
@@ -73,6 +73,10 @@ func newRunEngine(t *testing.T, cfg Config) *engine {
 	t.Helper()
 	cfg.Builder = "b"
 	cfg.GitTimeout = 30 * time.Second
+	if cfg.MemoryCeiling == 0 { // default: one 1g slot per lane, so lanes (not memory) bound concurrency
+		cfg.SlotMemory = 1 << 30
+		cfg.MemoryCeiling = int64(max(cfg.FastLane, 1)+max(cfg.SlowLane, 1)) * cfg.SlotMemory
+	}
 	e := newEngine(cfg, nil)
 	e.docker = fakeDocker(cfg)
 	return e
@@ -273,43 +277,93 @@ func TestDescriptorLanesCanOnlyLowerTheAgentLimit(t *testing.T) {
 	}
 }
 
-// ---- memory reservations ------------------------------------------------------------------------
+// ---- memory slots -------------------------------------------------------------------------------
 
-// Two services whose reservations do not both fit under the ceiling must run one after the other,
-// whatever lane they are in; ones that fit may overlap.
-func TestMemoryReservationsAreAdmittedAgainstTheCeiling(t *testing.T) {
-	const g = int64(1) << 30
-	e := newRunEngine(t, Config{FastLane: 4, SlowLane: 4, MemoryCeiling: 7 * g, MemoryDefault: 1 * g})
+const gib = int64(1) << 30
+
+// 8g budget / 4g slots = 2 slots: three services overlap at most two at a time, whatever the lanes.
+func TestSlotsBoundConcurrencyToCeilingOverSlot(t *testing.T) {
+	e := newRunEngine(t, Config{FastLane: 4, SlowLane: 4, MemoryCeiling: 8 * gib, SlotMemory: 4 * gib})
 	probe := &overlapProbe{}
 	e.execBuildx = fakeBuildx(probe.hook(0))
 	d := Descriptor{Project: "p", Services: []ServiceSpec{
-		{Name: "a", Dockerfile: "Dockerfile", Memory: "5g"},
-		{Name: "b", Dockerfile: "Dockerfile", Memory: "5g"}}}
-	runJob(t, e, d, BuildRequest{})
-	if got := probe.peak.Load(); got != 1 {
-		t.Fatalf("5g+5g under a 7g ceiling overlapped (peak %d)", got)
+		{Name: "a", Dockerfile: "Dockerfile"}, {Name: "b", Dockerfile: "Dockerfile"}, {Name: "c", Dockerfile: "Dockerfile"}}}
+	if b := runJob(t, e, d, BuildRequest{}); b.snapshot().State != BuildCompleted {
+		t.Fatalf("job: %s", b.snapshot().ErrorMsg)
 	}
-
-	e2 := newRunEngine(t, Config{FastLane: 4, SlowLane: 4, MemoryCeiling: 7 * g, MemoryDefault: 1 * g})
-	probe2 := &overlapProbe{}
-	e2.execBuildx = fakeBuildx(probe2.hook(0))
-	d2 := Descriptor{Project: "p", Services: []ServiceSpec{
-		{Name: "a", Dockerfile: "Dockerfile"}, {Name: "b", Dockerfile: "Dockerfile"}}} // default 1g each
-	runJob(t, e2, d2, BuildRequest{})
-	if got := probe2.peak.Load(); got != 2 {
-		t.Fatalf("two default 1g reservations should overlap under 7g (peak %d)", got)
+	if got := probe.peak.Load(); got != 2 {
+		t.Fatalf("8g/4g must run exactly 2 at once, peak %d", got)
 	}
 }
 
-func TestAdmitUnreservedWhenNoCeiling(t *testing.T) {
-	s := newScheduler(Config{FastLane: 1, SlowLane: 1})
-	if s.weight(ServiceSpec{Memory: "99g"}) != 0 {
-		t.Fatal("with no ceiling configured nothing is reserved (previous behaviour)")
+// Concurrent builds never share a builder (a cgroup): each admitted service holds a distinct slot, and
+// the lowest free one is taken so serial builds reuse slot 0's cache.
+func TestConcurrentBuildsGetDistinctSlotBuilders(t *testing.T) {
+	e := newRunEngine(t, Config{FastLane: 4, SlowLane: 4, MemoryCeiling: 12 * gib, SlotMemory: 4 * gib})
+	var mu sync.Mutex
+	seen := map[string]int{}
+	cur, peak := 0, 0
+	e.execBuildx = fakeBuildx(func(_ ServiceSpec, args []string) {
+		var name string
+		for i, a := range args {
+			if a == "--builder" {
+				name = args[i+1]
+			}
+		}
+		mu.Lock()
+		seen[name]++
+		cur++
+		peak = max(peak, cur)
+		if seen[name] > 1 && cur > 1 {
+			t.Errorf("builder %s used by two concurrent builds", name)
+		}
+		mu.Unlock()
+		time.Sleep(50 * time.Millisecond)
+		mu.Lock()
+		cur--
+		seen[name]--
+		mu.Unlock()
+	})
+	d := Descriptor{Project: "p", Services: []ServiceSpec{
+		{Name: "a", Dockerfile: "Dockerfile"}, {Name: "b", Dockerfile: "Dockerfile"}, {Name: "c", Dockerfile: "Dockerfile"}}}
+	runJob(t, e, d, BuildRequest{})
+	if peak != 3 {
+		t.Fatalf("12g/4g = 3 slots, peak %d", peak)
+	}
+	p := e.sched.slots
+	_, r0, _ := p.acquire(context.Background())
+	b1, r1, _ := p.acquire(context.Background())
+	r0()
+	b0, r0b, _ := p.acquire(context.Background())
+	if b1.name != "b-s1" || b0.name != "b" {
+		t.Fatalf("lowest free slot first: got %s then %s", b1.name, b0.name)
+	}
+	r1()
+	r0b()
+}
+
+// A build waiting for a slot is FIFO-queued, not refused, and a cancelled waiter frees its place.
+func TestSlotPoolQueuesAndCancels(t *testing.T) {
+	p := newSlotPool(Config{Builder: "b", MemoryCeiling: 4 * gib, SlotMemory: 4 * gib})
+	_, rel, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, _, err := p.acquire(ctx); err == nil {
+		t.Fatal("second acquire on a 1-slot pool must wait, then fail with the context")
+	}
+	rel()
+	if _, rel2, err := p.acquire(context.Background()); err != nil {
+		t.Fatalf("slot not returned after the cancelled waiter: %v", err)
+	} else {
+		rel2()
 	}
 }
 
 func TestSchedulerWiringIsOnePerEngine(t *testing.T) {
-	e := newEngine(Config{FastLane: 3, SlowLane: 2}, nil)
+	e := newEngine(Config{FastLane: 3, SlowLane: 2, MemoryCeiling: 2 * gib, SlotMemory: gib}, nil)
 	if e.sched == nil || e.sched.fast.size != 3 || e.sched.slow.size != 2 {
 		t.Fatal("engine must own one agent-wide scheduler sized from config")
 	}
