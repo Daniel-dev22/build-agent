@@ -79,6 +79,7 @@ type engine struct {
 	sched *scheduler
 
 	builderMu sync.Mutex // serializes ensureBuilder's inspect-then-create
+	recreated bool       // CC_RECREATE_BUILDER already honoured (guarded by builderMu)
 }
 
 func newEngine(cfg Config, cc *http.Client) *engine {
@@ -150,35 +151,50 @@ func cloneArgs(url, ref, dir string) []string {
 	return append(args, "--", url, dir)
 }
 
-// ensureBuilder reuses the persistent buildx builder (cache mounts survive); only
-// (re)creates it when missing or when CC_RECREATE_BUILDER=1.
+// ensureBuilder reuses the persistent buildx builder (cache mounts survive) and (re)creates it
+// only when missing, when it does not carry the memory cap, or once per agent lifetime when
+// CC_RECREATE_BUILDER=1.
 //
-// Serialized: concurrent jobs would otherwise race inspect-then-create on the one builder. When a
-// memory ceiling is configured, a reused builder is verified to actually carry the cap — a builder
-// without it would let a build exhaust the host, so the job fails loudly instead (the startup
-// reconcileBuilder is what repairs a stale builder; it is only safe while nothing is building).
+// Serialized: concurrent jobs would otherwise race inspect-then-create on the one builder. The cap
+// is judged on the builder CONTAINER, not the buildx store (memory.go): after a redeploy the store
+// is empty while the uncapped container survives, and buildx create over it silently drops the
+// limits. An uncapped container is repaired in place (container removed, state volume kept) when no
+// service is running; the cap is ALWAYS re-verified after a create, and the job fails loudly only
+// if the repair itself did not produce a capped builder.
 func (e *engine) ensureBuilder(ctx context.Context, b *Build) error {
 	e.builderMu.Lock()
 	defer e.builderMu.Unlock()
 	name := e.cfg.Builder
 	_, inspectErr := e.dockerRun(ctx, "buildx", "inspect", name)
-	exists := inspectErr == nil
-	if exists && os.Getenv("CC_RECREATE_BUILDER") != "1" {
-		if e.cfg.MemoryCeiling > 0 {
-			capped, err := e.builderCapped(ctx)
-			if err != nil {
-				return fmt.Errorf("verify builder memory cap: %w", err)
-			}
-			if !capped {
-				return fmt.Errorf("builder %s does not carry BUILD_MEMORY_CEILING (%d bytes); restart the agent so it is recreated with the cap", name, e.cfg.MemoryCeiling)
-			}
+	storeOK := inspectErr == nil
+	exists, capped := storeOK, true // no ceiling: the store alone decides, as before
+	if e.cfg.MemoryCeiling > 0 {
+		var err error
+		if exists, capped, err = e.containerState(ctx); err != nil {
+			return fmt.Errorf("inspect builder: %w", err)
 		}
+	}
+	capOK := e.cfg.MemoryCeiling <= 0 || capped
+	recreate := os.Getenv("CC_RECREATE_BUILDER") == "1" && !e.recreated
+	if storeOK && exists && capOK && !recreate {
 		b.appendLine("[builder] reusing " + name)
 		return nil
 	}
-	if exists {
-		// Explicit CC_RECREATE_BUILDER=1: the operator asked for a clean builder, state included.
+	if recreate {
+		// Explicit operator request, honoured once per agent lifetime (it used to fire on every job
+		// while set, deleting the cache volume each time). Clean builder, state included.
+		e.recreated = true
 		_, _ = e.dockerRun(ctx, "buildx", "rm", name, "--force")
+	} else if exists && !capOK {
+		if e.sched != nil && e.sched.running.Load() > 0 {
+			return fmt.Errorf("builder %s does not carry BUILD_MEMORY_CEILING (%d bytes) and builds are running; it is repaired by the next job once idle", name, e.cfg.MemoryCeiling)
+		}
+		b.appendLine("[builder] repairing: container lacks the memory cap, recreating it (state volume kept)")
+		if err := e.repairBuilder(ctx); err != nil {
+			return err
+		}
+	} else if storeOK && !exists {
+		_, _ = e.dockerRun(ctx, "buildx", "rm", "--keep-state", name) // stale store entry, container gone
 	}
 	out, err := e.dockerRun(ctx, builderCreateArgs(e.cfg)...)
 	for _, l := range strings.Split(out, "\n") {
@@ -188,6 +204,12 @@ func (e *engine) ensureBuilder(ctx context.Context, b *Build) error {
 	}
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
+	}
+	if e.cfg.MemoryCeiling > 0 {
+		_, capped, err := e.containerState(ctx)
+		if err != nil || !capped {
+			return fmt.Errorf("builder %s was created but does not carry BUILD_MEMORY_CEILING (%d bytes): %v", name, e.cfg.MemoryCeiling, err)
+		}
 	}
 	b.appendLine("[builder] created " + name)
 	return nil

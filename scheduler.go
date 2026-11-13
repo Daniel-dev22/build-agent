@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 // Agent-wide admission control.
@@ -103,6 +104,7 @@ type scheduler struct {
 	fast, slow *weightedSem
 	mem        *weightedSem // nil when no ceiling is configured
 	memDefault int64
+	running    atomic.Int32 // services currently admitted (inside buildx)
 }
 
 func newScheduler(cfg Config) *scheduler {
@@ -182,5 +184,8 @@ func (s *scheduler) admit(ctx context.Context, rl runLimits, svc ServiceSpec) (f
 		release()
 		return nil, fmt.Errorf("memory reservation: %w", err)
 	}
-	return release, nil
+	s.running.Add(1)
+	inner := release
+	var once sync.Once
+	return func() { once.Do(func() { s.running.Add(-1); inner() }) }, nil
 }

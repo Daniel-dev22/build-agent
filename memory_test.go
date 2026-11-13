@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -10,14 +11,14 @@ import (
 func TestParseBytes(t *testing.T) {
 	ok := map[string]int64{
 		"": 0, "0": 0, "1024": 1024, "512m": 512 << 20, "512M": 512 << 20, "6g": 6 << 30, "6GiB": 6 << 30,
-		"6gb": 6 << 30, " 2g ": 2 << 30, "64k": 64 << 10, "1t": 1 << 40,
+		"6gb": 6 << 30, " 2g ": 2 << 30, "64k": 64 << 10, "1t": 1 << 40, "7b": 7,
 	}
 	for in, want := range ok {
 		if got, err := parseBytes(in); err != nil || got != want {
 			t.Errorf("parseBytes(%q)=%d,%v want %d", in, got, err, want)
 		}
 	}
-	for _, bad := range []string{"g", "-1g", "1.5g", "six", "6x", "0x10"} {
+	for _, bad := range []string{"g", "-1g", "1.5g", "six", "6x", "0x10", "6i", "6ib", "6gx", "17179869185g", "8589934592g", "9223372036854775807k"} {
 		if _, err := parseBytes(bad); err == nil {
 			t.Errorf("parseBytes(%q) accepted", bad)
 		}
@@ -50,119 +51,185 @@ func TestBuilderCreateArgsCapMemoryAndSwapEqually(t *testing.T) {
 			t.Errorf("missing %q in %q", want, joined)
 		}
 	}
-	none := strings.Join(builderCreateArgs(Config{Builder: "b"}), " ")
-	if strings.Contains(none, "memory") {
-		t.Errorf("no ceiling configured must not add a cap (previous behaviour): %q", none)
+	if strings.Contains(strings.Join(builderCreateArgs(Config{Builder: "b"}), " "), "memory") {
+		t.Error("no ceiling configured must not add a cap (previous behaviour)")
 	}
 }
 
-// dockerLog records calls and answers builder inspect with a configurable cap.
-type dockerLog struct {
-	calls       []string
-	builderMem  string // "mem swap" for `docker inspect`; "" = builder absent
-	rmKeepState bool
+// fakeHost models the docker host the way production behaves: the buildx STORE (in the agent
+// container) and the builder CONTAINER (on the host daemon) are independent, and `buildx create`
+// over an existing container only starts it, discarding the --driver-opt limits.
+type fakeHost struct {
+	storeOK, exists bool
+	mem, swap       int64
+	creates         int
+	forceRm         int
+	calls           []string
+	dropSwap        bool // daemon without swap-limit support: swap reads back -1
+	createIgnoresCap bool // buildx create never applies the opts (even on a fresh container)
 }
 
-func (l *dockerLog) fn(_ context.Context, args ...string) (string, error) {
-	l.calls = append(l.calls, strings.Join(args, " "))
+func (h *fakeHost) fn(_ context.Context, args ...string) (string, error) {
+	line := strings.Join(args, " ")
+	h.calls = append(h.calls, line)
 	switch {
-	case len(args) >= 2 && args[0] == "buildx" && args[1] == "inspect":
-		if l.builderMem == "" {
-			return "", errors.New("no builder")
+	case line == "buildx inspect b":
+		if h.storeOK {
+			return "ok", nil
 		}
-		return "ok", nil
+		return "no builder", errors.New("no builder")
 	case args[0] == "inspect":
-		return l.builderMem, nil
-	case len(args) >= 3 && args[1] == "rm" && args[2] == "--keep-state":
-		l.rmKeepState = true
+		if !h.exists {
+			return "Error: No such object: x", errors.New("exit 1")
+		}
+		swap := h.swap
+		if h.dropSwap {
+			swap = -1
+		}
+		return strconv.FormatInt(h.mem, 10) + " " + strconv.FormatInt(swap, 10), nil
+	case args[0] == "rm" && args[1] == "-f":
+		h.exists = false
+	case strings.HasPrefix(line, "buildx rm --keep-state"):
+		h.storeOK = false
+	case strings.Contains(line, "buildx rm") && strings.Contains(line, "--force"):
+		h.forceRm++
+		h.storeOK, h.exists = false, false
+	case strings.HasPrefix(line, "buildx create"):
+		h.creates++
+		if h.storeOK {
+			return "existing name", errors.New("exists")
+		}
+		h.storeOK = true
+		if !h.exists {
+			h.exists = true
+			if !h.createIgnoresCap {
+				for _, a := range args {
+					if strings.HasPrefix(a, "memory=") {
+						h.mem, _ = strconv.ParseInt(strings.TrimPrefix(a, "memory="), 10, 64)
+					}
+					if strings.HasPrefix(a, "memory-swap=") {
+						h.swap, _ = strconv.ParseInt(strings.TrimPrefix(a, "memory-swap="), 10, 64)
+					}
+				}
+			}
+		}
 	}
 	return "", nil
 }
 
-func (l *dockerLog) did(prefix string) bool {
-	for _, c := range l.calls {
-		if strings.HasPrefix(c, prefix) {
+func (h *fakeHost) did(sub string) bool {
+	for _, c := range h.calls {
+		if strings.Contains(c, sub) {
 			return true
 		}
 	}
 	return false
 }
 
-func TestReconcileRecreatesAnUncappedBuilderKeepingState(t *testing.T) {
-	l := &dockerLog{builderMem: "0 0"}
-	e := &engine{cfg: Config{Builder: "b", MemoryCeiling: 7 << 30}, docker: l.fn}
-	if err := e.reconcileBuilder(context.Background()); err != nil {
+func hostEngine(h *fakeHost) *engine {
+	e := &engine{cfg: Config{Builder: "b", MemoryCeiling: 7 << 30}, docker: h.fn}
+	e.sched = newScheduler(e.cfg)
+	return e
+}
+
+// The deploy scenario: the agent container was recreated (store empty) while the uncapped builder
+// container survives on the host. create over it would keep it uncapped.
+func TestStoreLostButUncappedContainerSurvivingIsRepairedNotTrusted(t *testing.T) {
+	h := &fakeHost{storeOK: false, exists: true}
+	e := hostEngine(h)
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err != nil {
 		t.Fatal(err)
 	}
-	if !l.rmKeepState {
-		t.Fatalf("an uncapped builder must be removed with --keep-state; calls=%v", l.calls)
+	if h.mem != 7<<30 {
+		t.Fatalf("builder still uncapped after ensureBuilder: mem=%d calls=%v", h.mem, h.calls)
 	}
-	for _, c := range l.calls {
-		if strings.Contains(c, "rm --force") || strings.Contains(c, "rm b --force") {
-			t.Fatalf("--force would delete the BuildKit state volume (the Gradle cache): %q", c)
-		}
+	if h.forceRm != 0 || h.did("rm -f -v") || h.did(" -v ") {
+		t.Fatalf("repair must remove the container only, never the state volume: %v", h.calls)
 	}
-}
-
-func TestReconcileLeavesACorrectlyCappedBuilderAlone(t *testing.T) {
-	l := &dockerLog{builderMem: "7516192768 7516192768"}
-	e := &engine{cfg: Config{Builder: "b", MemoryCeiling: 7 << 30}, docker: l.fn}
-	if err := e.reconcileBuilder(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if l.did("buildx rm") {
-		t.Fatalf("a builder that already carries the cap must not be touched: %v", l.calls)
+	// And the next job reuses it: no refusal loop.
+	before := h.creates
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err != nil || h.creates != before {
+		t.Fatalf("second job: err=%v creates %d->%d", err, before, h.creates)
 	}
 }
 
-func TestReconcileIsANoOpWithoutACeiling(t *testing.T) {
-	l := &dockerLog{builderMem: "0 0"}
-	e := &engine{cfg: Config{Builder: "b"}, docker: l.fn}
-	if err := e.reconcileBuilder(context.Background()); err != nil || len(l.calls) != 0 {
-		t.Fatalf("err=%v calls=%v", err, l.calls)
-	}
-}
-
-func TestEnsureBuilderRefusesAnUncappedBuilderWhenACeilingIsSet(t *testing.T) {
-	l := &dockerLog{builderMem: "0 0"}
-	e := &engine{cfg: Config{Builder: "b", MemoryCeiling: 7 << 30}, docker: l.fn}
-	err := e.ensureBuilder(context.Background(), newJob(t))
+func TestEnsureBuilderVerifiesTheCapAfterCreate(t *testing.T) {
+	h := &fakeHost{createIgnoresCap: true}
+	err := hostEngine(h).ensureBuilder(context.Background(), newJob(t))
 	if err == nil || !strings.Contains(err.Error(), "BUILD_MEMORY_CEILING") {
-		t.Fatalf("an uncapped builder would let a build exhaust the host; want a clear refusal, got %v", err)
-	}
-	if l.did("buildx rm") || l.did("buildx create") {
-		t.Fatalf("ensureBuilder must never recreate under load (it would kill running builds): %v", l.calls)
+		t.Fatalf("a create that did not apply the cap must not be trusted: %v", err)
 	}
 }
 
-func TestEnsureBuilderCreatesCappedWhenMissingAndNeverForceRemoves(t *testing.T) {
-	l := &dockerLog{}
-	e := &engine{cfg: Config{Builder: "b", MemoryCeiling: 7 << 30}, docker: l.fn}
-	if err := e.ensureBuilder(context.Background(), newJob(t)); err != nil {
-		t.Fatal(err)
+func TestEnsureBuilderRepairsInPlaceOnlyWhenIdle(t *testing.T) {
+	h := &fakeHost{storeOK: true, exists: true}
+	e := hostEngine(h)
+	e.sched.running.Add(1)
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err == nil {
+		t.Fatal("must not recreate the builder under a running build")
 	}
-	var create string
-	for _, c := range l.calls {
-		if strings.HasPrefix(c, "buildx create") {
-			create = c
-		}
-		if strings.Contains(c, "--force") {
-			t.Fatalf("a missing builder must not be force-removed (state volume): %q", c)
-		}
+	if h.did("rm -f") || h.creates != 0 {
+		t.Fatalf("touched the builder while a build was running: %v", h.calls)
 	}
-	if !strings.Contains(create, "memory=7516192768") || !strings.Contains(create, "memory-swap=7516192768") {
-		t.Fatalf("created without the cap: %q", create)
+	e.sched.running.Add(-1)
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err != nil || h.mem != 7<<30 {
+		t.Fatalf("idle: repair expected, err=%v mem=%d", err, h.mem)
 	}
 }
 
-func TestEnsureBuilderReusesACappedBuilder(t *testing.T) {
-	t.Setenv("CC_RECREATE_BUILDER", "")
-	l := &dockerLog{builderMem: "7516192768 7516192768"}
-	e := &engine{cfg: Config{Builder: "b", MemoryCeiling: 7 << 30}, docker: l.fn}
-	if err := e.ensureBuilder(context.Background(), newJob(t)); err != nil {
+func TestSwapReadbackIsNotRequiredToMatch(t *testing.T) {
+	h := &fakeHost{storeOK: true, exists: true, mem: 7 << 30, swap: 7 << 30, dropSwap: true}
+	e := hostEngine(h)
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err != nil || h.creates != 0 {
+		t.Fatalf("a daemon without swap-limit support reads swap back as -1; Memory is the enforcing field: err=%v creates=%d", err, h.creates)
+	}
+	h.swap, h.dropSwap = 5, false // a WRONG memory must still fail
+	h.mem = 1 << 30
+	e.sched.running.Add(1)
+	if err := e.ensureBuilder(context.Background(), newJob(t)); err == nil {
+		t.Fatal("wrong Memory must not pass")
+	}
+}
+
+func TestReconcileRemovesOnlyAnUncappedContainerAndKeepsState(t *testing.T) {
+	h := &fakeHost{exists: true}
+	if err := hostEngine(h).reconcileBuilder(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if l.did("buildx create") {
-		t.Fatalf("reuse expected: %v", l.calls)
+	if h.exists || h.forceRm != 0 {
+		t.Fatalf("uncapped container must be removed without --force: %v", h.calls)
+	}
+	h2 := &fakeHost{exists: true, mem: 7 << 30, swap: 7 << 30}
+	_ = hostEngine(h2).reconcileBuilder(context.Background())
+	if h2.did("rm -f") || h2.did("buildx rm") {
+		t.Fatalf("a capped builder must not be touched: %v", h2.calls)
+	}
+	h3 := &fakeHost{exists: true}
+	e3 := hostEngine(h3)
+	e3.cfg.MemoryCeiling = 0
+	_ = e3.reconcileBuilder(context.Background())
+	if len(h3.calls) != 0 {
+		t.Fatalf("no ceiling: no-op, got %v", h3.calls)
+	}
+}
+
+func TestEnsureBuilderCreatesCappedWhenMissing(t *testing.T) {
+	h := &fakeHost{}
+	if err := hostEngine(h).ensureBuilder(context.Background(), newJob(t)); err != nil || h.mem != 7<<30 || h.forceRm != 0 {
+		t.Fatalf("err=%v mem=%d force=%d calls=%v", err, h.mem, h.forceRm, h.calls)
+	}
+}
+
+func TestRecreateEnvIsHonouredOncePerAgentLifetime(t *testing.T) {
+	t.Setenv("CC_RECREATE_BUILDER", "1")
+	h := &fakeHost{storeOK: true, exists: true, mem: 7 << 30, swap: 7 << 30}
+	e := hostEngine(h)
+	for i := 0; i < 3; i++ {
+		if err := e.ensureBuilder(context.Background(), newJob(t)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if h.forceRm != 1 {
+		t.Fatalf("CC_RECREATE_BUILDER deleted the cache volume %d times; want once", h.forceRm)
 	}
 }
