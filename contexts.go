@@ -72,8 +72,10 @@ func validateContexts(contexts map[string]ContextSpec) error {
 			return fmt.Errorf("contexts: name %q must match %s", name, contextNameRe)
 		}
 		c := contexts[name]
-		if strings.TrimSpace(c.Repo) == "" || strings.HasPrefix(c.Repo, "-") {
-			return fmt.Errorf("contexts.%s: repo is required and must not start with '-'", name)
+		// Only GitHub: the header auth is scoped to github.com, and a file:// URL or local path would
+		// let a descriptor pull another job's checkout (a private repo under WORK_DIR) into its context.
+		if !strings.HasPrefix(c.Repo, "https://github.com/") && !strings.HasPrefix(c.Repo, "git@github.com:") {
+			return fmt.Errorf("contexts.%s: repo must be an https://github.com/ or git@github.com: URL", name)
 		}
 	}
 	return nil
@@ -145,6 +147,9 @@ func (e *engine) cloneContexts(ctx context.Context, b *Build, d Descriptor, req 
 		sha := e.gitRevision(ctx, b, dir)
 		if sha == "" {
 			return nil, nil, fmt.Errorf("context %s: could not resolve %q to a commit", name, ref)
+		}
+		if shaRe.MatchString(ref) && sha != ref {
+			return nil, nil, fmt.Errorf("context %s: pinned %s but checked out %s", name, ref, sha)
 		}
 		cs = append(cs, namedContext{name: name, dir: dir})
 		results[name] = ContextResult{Repo: normalizeRepoURL(spec.Repo), Ref: ref, Revision: sha}

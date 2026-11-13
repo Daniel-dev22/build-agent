@@ -432,12 +432,18 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 		// os.Remove below, leaving a live token on disk under WORK_DIR. It sits
 		// beside — not inside — the context dir, so buildkit never receives it
 		// as context; the Dockerfile gets it only via --secret id=ghtoken.
-		secretFile = filepath.Join(b.jobRoot(), ".ghtoken")
-		if err := os.WriteFile(secretFile, []byte(tok.Token), 0o600); err != nil {
-			fail("write token secret: " + err.Error())
-			return
+		//
+		// The Dockerfile is handed the secret only when the APP repo itself is private and cloned by
+		// the agent: a private named context must not widen an uploaded-tarball Dockerfile's reach to
+		// the installation-wide token (it is only ever used here, for the context clone).
+		if req.ContextB64 == "" && isPrivate(req, e.cfg.PrivateRepoOwners) {
+			secretFile = filepath.Join(b.jobRoot(), ".ghtoken")
+			if err := os.WriteFile(secretFile, []byte(tok.Token), 0o600); err != nil {
+				fail("write token secret: " + err.Error())
+				return
+			}
+			defer os.Remove(secretFile)
 		}
-		defer os.Remove(secretFile)
 	}
 	if req.ContextB64 != "" {
 		if err := extractContextTarGz(req.ContextB64, dir); err != nil {
@@ -516,6 +522,9 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 				return
 			}
 			defer releaseSlot()
+			// The build deadline starts here, at admission, not when the job was accepted.
+			bctx, bcancel := e.buildDeadline(ctx)
+			defer bcancel()
 
 			b.setServiceState(svc.Name, SvcBuilding, func(sp *ServiceProgress) {
 				now := time.Now().UTC()
@@ -524,7 +533,7 @@ func (e *engine) run(ctx context.Context, b *Build, req BuildRequest, onChange f
 			})
 			onChange(EventProgress)
 
-			res, err := e.buildService(ctx, b, d, svc, registry, versionTag, apkBust, secretFile, prov, tagRotation, retentionKeep, notify, buildExtras{contexts: namedCtxs})
+			res, err := e.buildService(bctx, b, d, svc, registry, versionTag, apkBust, secretFile, prov, tagRotation, retentionKeep, notify, buildExtras{contexts: namedCtxs})
 			finish := func(sp *ServiceProgress) {
 				now := time.Now().UTC()
 				sp.EndedAt = &now

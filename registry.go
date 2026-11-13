@@ -181,18 +181,26 @@ func (r *registryClient) pruneOldTags(ctx context.Context, registry, image strin
 	// that changes nothing (same layers, same labels) pushes a NEW timestamp tag onto the SAME digest,
 	// so deleting a stale tag's digest would also delete the newer tag(s) — and :latest/:stable —
 	// that still reference it. Digests held by any kept or protected tag are therefore never deleted.
-	live := map[string]struct{}{}
-	for _, t := range candidates[:keep] {
-		if d := r.resolveDigest(ctx, base, t); d != "" {
-			live[d] = struct{}{}
-		}
+	//
+	// "Live" is EVERY tag that is not stale (kept timestamp tags, latest/stable/buildcache, semver and
+	// manual tags alike). A deletion fails CLOSED: if any live tag's digest cannot be resolved (timeout,
+	// non-200) the whole prune is skipped for this image, because a missing digest would let a stale
+	// tag that shares it take a live tag with it. Retention simply runs again after the next build.
+	staleSet := make(map[string]struct{}, len(stale))
+	for _, t := range stale {
+		staleSet[t] = struct{}{}
 	}
+	live := map[string]struct{}{}
 	for _, t := range tl.Tags {
-		if _, prot := protectedTags[t]; prot {
-			if d := r.resolveDigest(ctx, base, t); d != "" {
-				live[d] = struct{}{}
-			}
+		if _, isStale := staleSet[t]; isStale {
+			continue
 		}
+		d := r.resolveDigest(ctx, base, t)
+		if d == "" {
+			slog.Warn("registry retention skipped: cannot resolve a live tag's digest", "image", image, "tag", t)
+			return
+		}
+		live[d] = struct{}{}
 	}
 	seen := map[string]struct{}{}
 	deleted := 0

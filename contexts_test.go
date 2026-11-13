@@ -48,6 +48,7 @@ func newGitFixture(t *testing.T, names ...string) *gitFixture {
 		run(dir, "add", "-A")
 		run(dir, "commit", "-q", "-m", "one")
 		run(dir, "tag", "v1")
+		run(dir, "config", "uploadpack.allowAnySHA1InWant", "true")
 		f.tagSHA = run(dir, "rev-parse", "HEAD")
 		must(t, os.WriteFile(filepath.Join(dir, "v"), []byte("2"), 0o644))
 		run(dir, "commit", "-q", "-am", "two")

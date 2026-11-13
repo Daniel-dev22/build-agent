@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"os"
 	"os/exec"
+	"regexp"
 )
 
 // Git clone for every repo the agent fetches: the app repo and each named build context.
@@ -37,7 +38,40 @@ func gitAuthEnv(token string) []string {
 func (e *engine) gitClone(ctx context.Context, b *Build, repo, ref, dir, token string) error {
 	cctx, cancel := context.WithTimeout(ctx, e.cfg.GitTimeout)
 	defer cancel()
+	if shaRe.MatchString(ref) {
+		for _, cmd := range shaCmds(cctx, repo, ref, dir, token) {
+			if err := e.stream(b, "git", cmd, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	return e.stream(b, "git", cloneCmd(cctx, repo, ref, dir, token), nil)
+}
+
+// shaRe matches a full commit SHA. `git clone --branch` rejects one, so a ref pinned by SHA is
+// fetched directly (GitHub serves any reachable commit).
+var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// shaCmds is init + shallow fetch of one commit + detached checkout. The URL is a positional
+// argument of fetch, so it is never written to .git/config; auth is the same env header as a clone.
+func shaCmds(ctx context.Context, repo, sha, dir, token string) []*exec.Cmd {
+	url := repo
+	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if token != "" {
+		url = githubCloneURL(repo)
+		env = append(env, gitAuthEnv(token)...)
+	}
+	mk := func(args ...string) *exec.Cmd {
+		c := exec.CommandContext(ctx, "git", args...)
+		c.Env = env
+		return c
+	}
+	return []*exec.Cmd{
+		mk("init", "-q", "--", dir),
+		mk("-C", dir, "fetch", "-q", "--depth", "1", "--", url, sha),
+		mk("-C", dir, "checkout", "-q", "--detach", "FETCH_HEAD"),
+	}
 }
 
 // cloneCmd assembles the clone command. Pure (no exec) so a test can pin that the token reaches
